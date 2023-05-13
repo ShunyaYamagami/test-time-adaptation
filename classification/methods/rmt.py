@@ -16,6 +16,11 @@ logger = logging.getLogger(__name__)
 
 
 def update_ema_variables(ema_model, model, alpha_teacher):
+    """ Studentにした変更を, EMA(Exponential Moving Average) によりTeacherモデルへ反映する. 
+    :param ema_model: Teacher model
+    :param model: Student model
+    :param alpha_teacher: weight
+    """
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
     return ema_model
@@ -46,6 +51,7 @@ class RMT(TTAMethod):
         self.tta_transform = get_tta_transforms(self.dataset_name)
 
         # Setup EMA model
+        # Teacher モデル
         self.model_ema = self.copy_model(self.model)
         for param in self.model_ema.parameters():
             param.detach_()
@@ -63,7 +69,7 @@ class RMT(TTAMethod):
 
         # get source prototypes
         if os.path.exists(fname):
-            logger.info("Loading class-wise source prototypes...")
+            logger.info(f"Loading class-wise source prototypes from {fname}...")
             self.prototypes_src = torch.load(fname)
         else:
             os.makedirs(proto_dir_path, exist_ok=True)
@@ -112,6 +118,7 @@ class RMT(TTAMethod):
 
             if os.path.exists(ckpt_path):
                 logger.info("Loading warmup checkpoint...")
+                logger.info("----- Warmupするのが適切かはわからないが, とりあえず今はするとしよう. -----")
                 checkpoint = torch.load(ckpt_path)
                 self.model.load_state_dict(checkpoint["model"])
                 self.model_ema.load_state_dict(checkpoint["model_ema"])
@@ -149,8 +156,8 @@ class RMT(TTAMethod):
             imgs_src, labels_src = imgs_src.cuda(), labels_src.cuda().long()
 
             # forward the test data and optimize the model
-            outputs = self.model(imgs_src)
-            outputs_ema = self.model_ema(imgs_src)
+            outputs = self.model(imgs_src)  # Student モデルの出力
+            outputs_ema = self.model_ema(imgs_src)  # Teacher モデルの出力
             loss = symmetric_cross_entropy(outputs, outputs_ema).mean(0)
             loss.backward()
             self.optimizer.step()
@@ -238,12 +245,14 @@ class RMT(TTAMethod):
 
         with torch.no_grad():
             # dist[:, i] contains the distance from every source sample to one test sample
+            # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
             dist = F.cosine_similarity(
                 x1=self.prototypes_src.repeat(1, features_test.shape[0], 1),
                 x2=features_test.view(1, features_test.shape[0], features_test.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
                 dim=-1)
 
             # for every test feature, get the nearest source prototype and derive the label
+            # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
             _, indices = dist.topk(1, largest=True, dim=0)
             indices = indices.squeeze(0)
 
@@ -257,20 +266,23 @@ class RMT(TTAMethod):
         loss_trg.backward()
 
         if self.lambda_ce_src > 0:
-            # sample source batch
-            try:
-                batch = next(self.src_loader_iter)
-            except StopIteration:
-                self.src_loader_iter = iter(self.src_loader)
-                batch = next(self.src_loader_iter)
+            ############ Train on labeled source data -> 今回は完全Source-Freeとしたい. ############
+            raise ValueError('----- Training on labeled source data -----')
+            # logger.info('----- Training on labeled source data -----')
+            # # sample source batch
+            # try:
+            #     batch = next(self.src_loader_iter)
+            # except StopIteration:
+            #     self.src_loader_iter = iter(self.src_loader)
+            #     batch = next(self.src_loader_iter)
 
-            # train on labeled source data
-            imgs_src, labels_src = batch[0], batch[1]
-            features_src = self.feature_extractor(imgs_src.cuda())
-            outputs_src = self.classifier(features_src)
-            loss_ce_src = F.cross_entropy(outputs_src, labels_src.cuda().long())
-            loss_ce_src *= self.lambda_ce_src
-            loss_ce_src.backward()
+            # # train on labeled source data
+            # imgs_src, labels_src = batch[0], batch[1]
+            # features_src = self.feature_extractor(imgs_src.cuda())
+            # outputs_src = self.classifier(features_src)
+            # loss_ce_src = F.cross_entropy(outputs_src, labels_src.cuda().long())
+            # loss_ce_src *= self.lambda_ce_src
+            # loss_ce_src.backward()
 
         self.optimizer.step()
 

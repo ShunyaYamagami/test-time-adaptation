@@ -27,7 +27,7 @@ cfg = _C
 _C.SETTING = "continual"
 
 # Data directory
-_C.DATA_DIR = "./data"
+_C.DATA_DIR = "/nas/data/syamagami/tta"
 
 # Weight directory
 _C.CKPT_DIR = "./ckpt"
@@ -162,7 +162,8 @@ _C.GTTA.USE_STYLE_TRANSFER = False
 # --------------------------------- RMT options ----------------------------- #
 _C.RMT = CfgNode()
 
-_C.RMT.LAMBDA_CE_SRC = 1.0
+# _C.RMT.LAMBDA_CE_SRC = 1.0
+_C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
 _C.RMT.NUM_SAMPLES_WARM_UP = 50000

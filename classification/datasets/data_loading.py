@@ -87,26 +87,26 @@ def get_test_loader(setting, adaptation, dataset_name, root_dir, domain_name, se
                                                     corruptions_seq=domain_names_all,
                                                     transform=transform,
                                                     setting=setting)
-        elif dataset_name in {"imagenet_k", "imagenet_r", "imagenet_a"}:
-            test_dataset = torchvision.datasets.ImageFolder(root=data_dir, transform=transform)
-        elif dataset_name in {"imagenet_d", "imagenet_d109", "domainnet126", "office31", "visda"}:
-            # create the symlinks needed for imagenet-d variants
-            if dataset_name in {"imagenet_d", "imagenet_d109"}:
-                for dom_name in domain_names_all:
-                    if not os.path.exists(os.path.join(data_dir, dom_name)):
-                        logger.info(f"Creating symbolical links for ImageNet-D {dom_name}...")
-                        domainnet_dir = os.path.join(complete_data_dir_path(root=root_dir, dataset_name="domainnet126"), dom_name)
-                        create_symlinks_and_get_imagenet_visda_mapping(domainnet_dir, map_dict)
+        # elif dataset_name in {"imagenet_k", "imagenet_r", "imagenet_a"}:
+        #     test_dataset = torchvision.datasets.ImageFolder(root=data_dir, transform=transform)
+        # elif dataset_name in {"imagenet_d", "imagenet_d109", "domainnet126", "office31", "visda"}:
+        #     # create the symlinks needed for imagenet-d variants
+        #     if dataset_name in {"imagenet_d", "imagenet_d109"}:
+        #         for dom_name in domain_names_all:
+        #             if not os.path.exists(os.path.join(data_dir, dom_name)):
+        #                 logger.info(f"Creating symbolical links for ImageNet-D {dom_name}...")
+        #                 domainnet_dir = os.path.join(complete_data_dir_path(root=root_dir, dataset_name="domainnet126"), dom_name)
+        #                 create_symlinks_and_get_imagenet_visda_mapping(domainnet_dir, map_dict)
 
-            # prepare a list containing all paths of the image-label-files
-            if "mixed_domains" in setting:
-                data_files = [os.path.join("datasets", f"{dataset_name}_lists", dom_name + "_list.txt") for dom_name in domain_names_all]
-            else:
-                data_files = [os.path.join("datasets", f"{dataset_name}_lists", domain_name + "_list.txt")]
+        #     # prepare a list containing all paths of the image-label-files
+        #     if "mixed_domains" in setting:
+        #         data_files = [os.path.join("datasets", f"{dataset_name}_lists", dom_name + "_list.txt") for dom_name in domain_names_all]
+        #     else:
+        #         data_files = [os.path.join("datasets", f"{dataset_name}_lists", domain_name + "_list.txt")]
 
-            test_dataset = ImageList(image_root=data_dir,
-                                     label_files=data_files,
-                                     transform=transform)
+        #     test_dataset = ImageList(image_root=data_dir,
+        #                              label_files=data_files,
+        #                              transform=transform)
         else:
             raise ValueError(f"Dataset '{dataset_name}' is not supported!")
 

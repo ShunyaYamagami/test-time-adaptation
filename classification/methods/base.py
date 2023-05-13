@@ -1,14 +1,18 @@
+import logging
+
 import torch
 import torch.nn as nn
 from torch.nn.utils.weight_norm import WeightNorm
 
 from copy import deepcopy
 from models.model import ResNetDomainNet126
+logger = logging.getLogger(__name__)
 
 
 class TTAMethod(nn.Module):
     def __init__(self, model, optimizer, steps=1, episodic=False, window_length=1):
         super().__init__()
+        # Student モデル
         self.model = model
         self.optimizer = optimizer
         self.steps = steps
@@ -34,6 +38,8 @@ class TTAMethod(nn.Module):
         x = x if isinstance(x, list) else [x]
 
         if x[0].shape[0] == 1:  # single sample test-time adaptation
+            logger.info("----- single sample test-time adaptation -----")
+            logger.info(f"----- self.input_buffer: {self.input_buffer}  self.input_buffer[0].shape: {self.input_buffer[0].shape}  self.window_length: {self.window_length} -----")
             # create the sliding window input
             if self.input_buffer is None:
                 self.input_buffer = [x_item for x_item in x]
@@ -49,6 +55,7 @@ class TTAMethod(nn.Module):
 
             if self.pointer == (self.window_length - 1):
                 # update the model, since the complete buffer has changed
+                logger.info("----- self.forward_and_adapt() -----")
                 for _ in range(self.steps):
                     outputs = self.forward_and_adapt(self.input_buffer)
                 outputs = outputs[self.pointer.long()]
@@ -56,6 +63,7 @@ class TTAMethod(nn.Module):
                 # create the prediction without updating the model
                 if self.has_bn:
                     # forward the whole buffer to get good batchnorm statistics
+                    logger.info("----- self.forward_sliding_window() -----")
                     outputs = self.forward_sliding_window(self.input_buffer)
                     outputs = outputs[self.pointer.long()]
                 else:
@@ -67,6 +75,9 @@ class TTAMethod(nn.Module):
             self.pointer %= self.window_length
 
         else:   # common batch adaptation setting
+            ##### GitHubそのまま動かすとこっちが実行される #####
+            # logger.info("----- common batch adaptation setting -----")
+            # logger.info("----- self.forward_and_adapt() -----")
             for _ in range(self.steps):
                 outputs = self.forward_and_adapt(x)
 

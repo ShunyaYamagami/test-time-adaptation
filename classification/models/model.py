@@ -271,10 +271,12 @@ def get_model(cfg, num_classes):
         try:
             # load model from torchvision
             base_model = get_torchvision_model(cfg.MODEL.ARCH, weight_version=cfg.MODEL.WEIGHTS)
+            logger.info("----- loaded model from torchvision -----")
         except ValueError:
             try:
                 # load model from timm
                 base_model = get_timm_model(cfg.MODEL.ARCH)
+                logger.info("----- loaded model from timm -----")
             except ValueError:
                 try:
                     # load some custom models
@@ -283,13 +285,15 @@ def get_model(cfg, num_classes):
                         checkpoint = torch.load(cfg.CKPT_PATH, map_location="cpu")
                         base_model.load_state_dict(checkpoint['net'])
                         base_model = normalize_model(base_model, resnet26.MEAN, resnet26.STD)
+                        logger.info("----- loaded base_model resnet26_gn -----")
                     else:
                         raise ValueError(f"Model {cfg.MODEL.ARCH} is not supported!")
                     logger.info(f"Successfully restored model '{cfg.MODEL.ARCH}' from: {cfg.CKPT_PATH}")
                 except ValueError:
                     # load model from robustbench
-                    dataset_name = cfg.CORRUPTION.DATASET.split("_")[0]
+                    dataset_name = cfg.CORRUPTION.DATASET.split("_")[0]  # e.g. imagenet_c -> imagenet
                     base_model = load_model(cfg.MODEL.ARCH, cfg.CKPT_DIR, dataset_name, ThreatModel.corruptions)
+                    logger.info("----- loaded base_model from model_zoo -----")
 
         if cfg.CORRUPTION.DATASET == "imagenet_a":
             base_model = ImageNetXWrapper(base_model, IMAGENET_A_MASK)

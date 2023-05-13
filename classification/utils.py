@@ -64,6 +64,7 @@ def get_accuracy(model: torch.nn.Module,
     with torch.no_grad():
         for i, data in enumerate(data_loader):
             imgs, labels = data[0], data[1]
+            # methods/base.py forward() -> rmt.py 
             output = model([img.to(device) for img in imgs]) if isinstance(imgs, list) else model(imgs.to(device))
             predictions = output.argmax(1)
 
