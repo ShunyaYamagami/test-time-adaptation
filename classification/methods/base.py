@@ -40,6 +40,7 @@ class TTAMethod(nn.Module):
         if x[0].shape[0] == 1:  # single sample test-time adaptation
             logger.info("----- single sample test-time adaptation -----")
             logger.info(f"----- self.input_buffer: {self.input_buffer}  self.input_buffer[0].shape: {self.input_buffer[0].shape}  self.window_length: {self.window_length} -----")
+            raise ValueError("今の所こっちは対象外なので，使わない事を分かりやすくするためだけにエラーを出しとく.")
             # create the sliding window input
             if self.input_buffer is None:
                 self.input_buffer = [x_item for x_item in x]

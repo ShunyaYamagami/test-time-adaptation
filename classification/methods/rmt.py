@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from methods.base import TTAMethod
 from models.model import split_up_model
 from augmentations.transforms_cotta import get_tta_transforms
+import clip
+# from domainbed import algorithms
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +60,28 @@ class RMT(TTAMethod):
 
         # split up the model
         self.feature_extractor, self.classifier = split_up_model(model, arch_name, self.dataset_name)
+        # ##############################################################################
+        # # DPLCLIP
+        # from easydict import EasyDict
+        # args = EasyDict({
+        #     "algorithm": "DPLCLIP",
+        #     "clip_backbone": 'ViT-B/32',
+        #     "lr": 1e-3,
+        #     'momentum': 0.1,
+        #     'num_domain_tokens': 16,
+        #     'class_names': sorted("airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truck"),
+        # })
+        # algorithm_class = algorithms.get_algorithm_class(args.algorithm)
+        # algorithm = algorithm_class(
+        #     dataset.input_shape,
+        #     dataset.num_classes,
+        #     len(dataset) - len(args.test_envs),
+        #     hparams)
+        # algorithm_dict = algorithm.state_dict()
+        # if algorithm_dict is not None:
+        #     algorithm.load_state_dict(algorithm_dict)
+        # algorithm.to(device)
+        # ##############################################################################
 
         # define the prototype paths
         proto_dir_path = os.path.join(ckpt_dir, "prototypes")
@@ -72,6 +96,7 @@ class RMT(TTAMethod):
             logger.info(f"Loading class-wise source prototypes from {fname}...")
             self.prototypes_src = torch.load(fname)
         else:
+            raise ValueError("今の所こっちは使わないので，使わない事を分かりやすくするためだけにエラーを出しておく")
             os.makedirs(proto_dir_path, exist_ok=True)
             features_src = torch.tensor([])
             labels_src = torch.tensor([])
