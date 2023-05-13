@@ -1,3 +1,5 @@
+<!-- 5/12 -->
+
 - Image/Text encoder 導入
 - Student, Teacher をを Propmt Net に切り替え
 - Prompt Net の初期化をどうするか？
@@ -15,3 +17,19 @@
   二重確率行列に直して co-clustering を行うことで，Domain Loss を計算し，Domain-Specific Feature を取得する Network を Student と Teacher で構築すれば良いのでは？
   ClassName の代わりに RPL を付加しても良いかもしれない．
   こうして，Prompt は Domain-specific な特徴を持つようになり，似たドメインで纏まりつつ，同じクラスでまとまるようになる
+
+<!----------------------------------------------------------------------------->
+<!-- 5/13 -->
+
+次やること
+
+今は類似度行列を用いた損失関数を俺仕様にカスタマイズすることはしなくていい．
+Domain Prompt Net も考えなくていい
+
+やることは
+
+- Student/Teacher Encoder を, CLIP + Student/Teacher Prompt Encoder にし
+- Student/Teacher それぞれでクラス予測を行い
+- その symmetric cross entropy を計算する.
+
+RMT とあんま買えてないっしょ？
