@@ -78,15 +78,15 @@ def evaluate(description):
 
     # start evaluation
     for i_dom, domain_name in enumerate(dom_names_loop):
-        if i_dom == 0 or "reset_each_shift" in cfg.SETTING:
-            try:
-                # pre-trained modelの重みをロード
-                model.reset()
-                logger.info("resetting model")
-            except:
-                logger.warning("not resetting model")
-        else:
-            logger.warning("not resetting model")
+        # if i_dom == 0 or "reset_each_shift" in cfg.SETTING:
+        #     try:
+        #         # pre-trained modelの重みをロード
+                # model.reset()
+        #         logger.info("resetting model")
+        #     except:
+        #         logger.warning("not resetting model")
+        # else:
+        #     logger.warning("not resetting model")
 
         for severity in severities:
             test_data_loader = get_test_loader(setting=cfg.SETTING,
