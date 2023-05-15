@@ -166,7 +166,8 @@ _C.RMT = CfgNode()
 _C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
-_C.RMT.NUM_SAMPLES_WARM_UP = 50000
+# _C.RMT.NUM_SAMPLES_WARM_UP = 50000
+_C.RMT.NUM_SAMPLES_WARM_UP = 500000
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()

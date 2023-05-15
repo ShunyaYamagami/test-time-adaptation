@@ -42,10 +42,23 @@ def get_transform(dataset_name, adaptation):
     else:
         # create non-method specific transformation
         if dataset_name in {"cifar10", "cifar100"}:
-            ### TODO: clip.load()時のpreprocessを使えばここを変更しなくても良い気がするが，それにはDataLoader作成時にcollate_fnを定義し直す必要がある.
-            transform = transforms.Compose([transforms.Resize(224),transforms.ToTensor()])
+            # refer clip.load preprocess
+            transform = transforms.Compose([
+                # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+                transforms.Resize(224),
+                # transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+            ])
         elif dataset_name in {"cifar10_c", "cifar100_c"}:
-            transform = transforms.Compose([transforms.Resize(224),transforms.ToTensor()])
+            # refer clip.load preprocess
+            transform = transforms.Compose([
+                # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+                transforms.Resize(224),
+                # transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+            ])
             # transform = None
         elif dataset_name == "imagenet_c":
             # note that ImageNet-C is already resized and centre cropped

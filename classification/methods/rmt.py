@@ -374,6 +374,7 @@ class RMT(TTAMethod):
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
     def forward_and_adapt(self, x):
         imgs_test = x[0]
+        imgs_test_aug = self.tta_transform((imgs_test))
 
         self.optimizer.zero_grad()
         ###########################################################################################
@@ -416,9 +417,12 @@ class RMT(TTAMethod):
         #########################################################################################
         #########################################################################################
         logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_test)
-        # TODO:ベクトル同士で比較してしまっていないか？ラベルで比較した方が良いのではないか？
-        loss = symmetric_cross_entropy(logits_per_image, logits_per_image_ema).mean(0)
-        loss.backward()
+        logits_per_image_aug, _ = self._calc_clip_logits(imgs_test_aug)
+
+        loss_entropy = self_training(x=logits_per_image, x_aug=logits_per_image_aug, x_ema=logits_per_image_ema).mean(0)
+        # loss_trg = self.lambda_ce_trg * loss_entropy + self.lambda_cont * loss_contrastive
+        loss_trg = loss_entropy
+        loss_trg.backward()
 
         if self.lambda_ce_src > 0:
             ############ Train on labeled source data -> 今回は完全Source-Freeとしたい. ############
@@ -488,10 +492,9 @@ def self_training(x, x_aug, x_ema):# -> torch.Tensor:
     return - 0.25 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.25 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1) \
            - 0.25 * (x_ema.softmax(1) * x_aug.log_softmax(1)).sum(1) - 0.25 * (x_aug.softmax(1) * x_ema.log_softmax(1)).sum(1)
 
-
 @torch.jit.script
 def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
-    return -0.5*(x_ema.softmax(1) * x.log_softmax(1)).sum(1)-0.5*(x.softmax(1) * x_ema.log_softmax(1)).sum(1)
+    return -0.5 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.5 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1)
 
 def to_numpy_array(lst):
     np_array = []

@@ -111,7 +111,7 @@ def evaluation(model, dataloader, model_name="clip", cuda_i=0):
 
 
 if __name__ == '__main__':
-    dataset_name = "cifar100"
+    dataset_name = "cifar10"
     print(f"----- dataset: {dataset_name} -----")
     clip_dataset, clip_loader = get_dataloader(dataset_name, does_resize = True)
     vit_dataset, vit_loader   = get_dataloader(dataset_name, does_resize = False)
