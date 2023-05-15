@@ -27,7 +27,7 @@ cfg = _C
 _C.SETTING = "continual"
 
 # Data directory
-_C.DATA_DIR = "/nas/data/syamagami/tta"
+_C.DATA_DIR = "/nas/data/syamagami/tta/rmt"
 
 # Weight directory
 _C.CKPT_DIR = "./ckpt"

@@ -10,11 +10,12 @@ logger = logging.getLogger(__name__)
 
 
 class TTAMethod(nn.Module):
-    def __init__(self, model, optimizer, steps=1, episodic=False, window_length=1):
+    # def __init__(self, model, optimizer, steps=1, episodic=False, window_length=1):
+    def __init__(self, steps=1, episodic=False, window_length=1):
         super().__init__()
         # Student モデル
-        self.model = model
-        self.optimizer = optimizer
+        # self.model = model
+        # self.optimizer = optimizer
         self.steps = steps
         assert steps > 0, "requires >= 1 step(s) to forward and update"
         self.episodic = episodic
@@ -24,12 +25,12 @@ class TTAMethod(nn.Module):
         self.window_length = window_length
         self.pointer = torch.tensor([0], dtype=torch.long).cuda()
         # sstta: if the model has no batchnorm layers, we do not need to forward the whole buffer when not performing any updates
-        self.has_bn = any([isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)) for m in model.modules()])
+        # self.has_bn = any([isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d)) for m in model.modules()])
 
         # note: if the self.model is never reset, like for continual adaptation,
         # then skipping the state copy would save memory
-        self.models = [self.model]
-        self.model_states, self.optimizer_state = self.copy_model_and_optimizer()
+        # self.models = [self.model]
+        # self.model_states, self.optimizer_state = self.copy_model_and_optimizer()
 
     def forward(self, x):
         if self.episodic:
@@ -38,9 +39,9 @@ class TTAMethod(nn.Module):
         x = x if isinstance(x, list) else [x]
 
         if x[0].shape[0] == 1:  # single sample test-time adaptation
+            raise ValueError("今の所こっちは対象外なので，使わない事を分かりやすくするためだけにエラーを出しとく.")
             logger.info("----- single sample test-time adaptation -----")
             logger.info(f"----- self.input_buffer: {self.input_buffer}  self.input_buffer[0].shape: {self.input_buffer[0].shape}  self.window_length: {self.window_length} -----")
-            raise ValueError("今の所こっちは対象外なので，使わない事を分かりやすくするためだけにエラーを出しとく.")
             # create the sliding window input
             if self.input_buffer is None:
                 self.input_buffer = [x_item for x_item in x]
@@ -144,20 +145,21 @@ class TTAMethod(nn.Module):
                     else:
                         m.eval()
 
-    @staticmethod
-    def collect_params(model):
-        """Collect all trainable parameters.
+    # pre-trained modelのパラメータを取得する関数
+    # @staticmethod
+    # def collect_params(model):
+    #     """Collect all trainable parameters.
 
-        Walk the model's modules and collect all parameters.
-        Return the parameters and their names.
+    #     Walk the model's modules and collect all parameters.
+    #     Return the parameters and their names.
 
-        Note: other choices of parameterization are possible!
-        """
-        params = []
-        names = []
-        for nm, m in model.named_modules():
-            for np, p in m.named_parameters():
-                if np in ['weight', 'bias'] and p.requires_grad:
-                    params.append(p)
-                    names.append(f"{nm}.{np}")
-        return params, names
+    #     Note: other choices of parameterization are possible!
+    #     """
+    #     params = []
+    #     names = []
+    #     for nm, m in model.named_modules():
+    #         for np, p in m.named_parameters():
+    #             if np in ['weight', 'bias'] and p.requires_grad:
+    #                 params.append(p)
+    #                 names.append(f"{nm}.{np}")
+    #     return params, names

@@ -6,6 +6,7 @@ import logging
 from glob import glob
 from typing import Optional, Sequence
 
+import torchvision.transforms as transforms
 from robustbench.data import CORRUPTIONS, PREPROCESSINGS, load_cifar10c, load_cifar100c
 from robustbench.loaders import CustomImageFolder, CustomCifarDataset
 

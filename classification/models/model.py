@@ -265,6 +265,7 @@ class TransformerWrapper(torch.nn.Module):
 
 
 def get_model(cfg, num_classes):
+    """ ベースとなるpre-trained model(ViTなど)をロード. """
     if cfg.CORRUPTION.DATASET == "domainnet126":
         base_model = ResNetDomainNet126(arch=cfg.MODEL.ARCH, checkpoint_path=cfg.CKPT_PATH, num_classes=num_classes)
     else:

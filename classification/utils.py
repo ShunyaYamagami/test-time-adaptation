@@ -67,6 +67,12 @@ def get_accuracy(model: torch.nn.Module,
             # methods/base.py forward() -> rmt.py 
             output = model([img.to(device) for img in imgs]) if isinstance(imgs, list) else model(imgs.to(device))
             predictions = output.argmax(1)
+            # print("*"*100)
+            # print(output.shape)
+            # print(predictions.shape)
+            # print(output)
+            # print(predictions)
+            # print("*"*100)
 
             if dataset_name == "imagenet_d" and domain_name != "none":
                 mapping_vector = list(IMAGENET_D_MAPPING.values())

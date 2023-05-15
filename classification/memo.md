@@ -32,4 +32,11 @@ Domain Prompt Net も考えなくていい
 - Student/Teacher それぞれでクラス予測を行い
 - その symmetric cross entropy を計算する.
 
-RMT とあんま買えてないっしょ？
+RMT とあんま変えてないっしょ？
+
+<!----------------------------------------------------------------------------->
+<!-- 5/13 -->
+
+CLIP の入力と合わせるために，`classification/datasets/data_loading.py`で画像サイズを 32 から 224 に変更した．
+これで精度の低下が発生するかもしれないから，要確認．
+`transform = transforms.Compose([transforms.Resize(224), transforms.ToTensor()])`

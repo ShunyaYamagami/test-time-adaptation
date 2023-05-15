@@ -108,6 +108,8 @@ class DPLCLIP(CLIP):
         # torch.Size([7, 68, self.EMBEDDING_DIM]), 68 := 77 - num_domain_tokens_tokens - 2.
         # [ 0.0013,  0.0046, -0.0115,  ...,  0.0112,  0.0147,  0.0040],...,.
         
+        # F() Network for extraction of domain feature.
+        # これがStudentモデルになる．
         self.network = networks.MLP(self.EMBEDDING_DIM, self.EMBEDDING_DIM * hparams['num_domain_tokens'], hparams).to(device=self.device, dtype=self.clip_model.dtype)
         
         def init_weights(m):
@@ -125,28 +127,36 @@ class DPLCLIP(CLIP):
             
     def update(self, minibatches, unlabeled=None):
         # minibatches = [[domain_1], [domain_2], [domain_3]]
-        all_x = [data[0].cuda().float() for data in minibatches]
-        all_y = torch.cat([data[1].cuda().long() for data in minibatches])
+        """ OfficeHomeの場合
+            minibatches :    3  # Sourceドメイン数
+            all_x :          (3, 32, 3, 224, 224)  # (Sourceドメイン数, B, C, W, H)
+            all_y :          (96,)  # (Sourceドメイン数 * B)
+            image_features :         (3, 32, 512)  # (Sourceドメイン数, B, EMBEDDING_DIM)
+            domain_features :        (3, 32, 8192)  # (Sourceドメイン数, B, EMBEDDING_DIM * num_domain_tokens)
+            image_features :         (96, 512)  # (Sourceドメイン数 * B, EMBEDDING_DIM)
+            mean_domain_features :   (3, 1, 8192)  # (Sourceドメイン数, 1, EMBEDDING_DIM * num_domain_tokens)
+            _mean_domain_features :  (3, 65, 8192)  # (Sourceドメイン数, Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
+            text_features :          (195, 512)  # (Sourceドメイン数 * Sourceクラス数, EMBEDDING_DIM)
+            logits_per_image :       (96, 195)  # (Sourceドメイン数 * B, Sourceドメイン数 * Sourceクラス数)
+        """
+        
+        all_x = [data[0].cuda().float() for data in minibatches]  # (Sourceドメイン数, B, C, W, H)
+        all_y = torch.cat([data[1].cuda().long() for data in minibatches])  # (Sourceドメイン数 * B)
 
         #  encode image for each domain.
-        image_features = [self.clip_model.encode_image(x) for x in all_x]
+        image_features = [self.clip_model.encode_image(x) for x in all_x]  # (Sourceドメイン数, B, EMBEDDING_DIM)
         
-        #  extract domain_feature for each domain. [32, self.EMBEDDING_DIM] -> [32, self.EMBEDDING_DIM * num_domain_tokens] -> [self.EMBEDDING_DIM * num_domain_tokens].
-        domain_features = [self.network(feature) for feature in image_features]
-        image_features = torch.cat(image_features)
-        #  reshape [self.batch_size, self.EMBEDDING_DIM.]:  -> [1, self.EMBEDDING_DIM.]
-        mean_domain_features = [feature.mean(dim=0, keepdim=True) for feature in domain_features]
+        domain_features = [self.network(feature) for feature in image_features]  # (Sourceドメイン数, B, EMBEDDING_DIM * num_domain_tokens)
+        image_features = torch.cat(image_features)  # (Sourceドメイン数 * B, EMBEDDING_DIM)
+        mean_domain_features = [feature.mean(dim=0, keepdim=True) for feature in domain_features]  # (Sourceドメイン数, 1, EMBEDDING_DIM * num_domain_tokens)
 
-        #  reshape [1, self.EMBEDDING_DIM.]:  -> [7, self.EMBEDDING_DIM.]
-        _mean_domain_features = [feature.repeat_interleave(len(self.hparams['class_names']), dim=0) for feature in mean_domain_features]
+        _mean_domain_features = [feature.repeat_interleave(len(self.hparams['class_names']), dim=0) for feature in mean_domain_features]  # (Sourceドメイン数, Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
         
-        #  generate text_feature from domain_feature. text_features.size = [3, 7, 512]
-        # text_features = [self._get_text_features(feature) for feature in _mean_domain_features]
-        text_features = torch.cat([self._get_text_features(feature) for feature in _mean_domain_features])
+        text_features = torch.cat([self._get_text_features(feature) for feature in _mean_domain_features])  # (Sourceドメイン数 * Sourceクラス数, EMBEDDING_DIM)
             
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        logits_per_image = self.clip_model.logit_scale.exp() * image_features @ text_features.t()
+        logits_per_image = self.clip_model.logit_scale.exp() * image_features @ text_features.t()  # (Sourceドメイン数 * B, Sourceドメイン数 * Sourceクラス数)
         loss = F.cross_entropy(logits_per_image, all_y)
             
         self.optimizer.zero_grad()
