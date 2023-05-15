@@ -50,6 +50,7 @@ class RMT(TTAMethod):
             "load_warmup_model": False  ######### 今は毎回warmupしよう.
         })
         self.set_clip_models()
+        self._set_student_teacher_models()
 
         self.dataset_name = dataset_name
         self.num_classes = num_classes
@@ -69,16 +70,6 @@ class RMT(TTAMethod):
         self.final_lr = self.optimizer.param_groups[0]["lr"]
 
         self.tta_transform = get_tta_transforms(self.dataset_name)
-
-        # Setup EMA model
-        # Teacher モデル
-        self.model_ema = self.copy_model(self.model)
-        for param in self.model_ema.parameters():
-            param.detach_()
-
-        # split up the model
-        # pre-trained modelを分割する. 間でsource prototypesにalignさせるためだな.
-        # self.feature_extractor, self.classifier = split_up_model(model, arch_name, self.dataset_name)
 
         # define the prototype paths
         proto_dir_path = os.path.join(ckpt_dir, "prototypes")
@@ -199,29 +190,33 @@ class RMT(TTAMethod):
         self.register_buffer('token_prefix', embedding[:, :1, :])  # (クラス数, 1, self.EMBEDDING_DIM)  [-0.0001,  0.0002, -0.0046,  ...,  0.0010,  0.0025,  0.0049]
         # CLS, EOS
         self.register_buffer('token_suffix', embedding[:, self.hparams['num_domain_tokens'] + 1:, :])  # (クラス数, 68, self.EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2. , [ 0.0013,  0.0046, -0.0115,  ...,  0.0112,  0.0147,  0.0040],...,.
-        
-        # F() Network for extraction of domain feature.
-        ######################################################
-        ######################################################
-        ###### ここで, self.modelとしているのは F() Network. 元コードのpre-trained modelとは異なることに注意.
-        ###### 既存コードを書きたくなかったからこうした．
-        ###### どちらも同じ "Student model"という意味では共通している.
-        ######################################################
-        ######################################################
-        self.model = networks.MLP(self.EMBEDDING_DIM, self.EMBEDDING_DIM * self.hparams['num_domain_tokens'], self.hparams).to(device=self.device, dtype=self.clip_model.dtype)
-        
+    
+
+    def _set_student_teacher_models(self):
+        """ F() Network for extraction of domain feature.
+
+            ここで, self.modelとしているのは F() Network. 元コードのpre-trained modelとは異なることに注意.
+            既存コードを書きたくなかったからこうした．
+            どちらも同じ "Student model"という意味では共通している.
+        """
         def init_weights(m):
             if isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform(m.weight)
                 m.bias.data.fill_(0.01)
-        
+        # Student model
+        self.model = networks.MLP(self.EMBEDDING_DIM, self.EMBEDDING_DIM * self.hparams['num_domain_tokens'], self.hparams).to(device=self.device, dtype=self.clip_model.dtype)
         self.model.apply(init_weights)
+        # Setup EMA model (Teacherモデル)  重みの更新はしない
+        self.model_ema = self.copy_model(self.model)
+        for param in self.model_ema.parameters():
+            param.detach_()
         
         self.optimizer = torch.optim.SGD(
             self.model.parameters(),
             lr=self.hparams['lr'],
             momentum=self.hparams['momentum']
         )
+
 
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
     def warmup(self):
