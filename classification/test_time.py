@@ -10,6 +10,7 @@ from utils import get_accuracy, eval_domain_dict
 from conf import cfg, load_cfg_fom_args, get_num_classes, get_domain_sequence
 from datasets.data_loading import get_source_loader, get_test_loader
 
+from methods.source_only_clip import SourceOnlyCLIP
 from methods.bn import AlphaBatchNorm, EMABatchNorm
 from methods.tent import Tent
 from methods.ttaug import TTAug
@@ -41,14 +42,11 @@ def evaluate(description):
                            ]
 
     num_classes = get_num_classes(dataset_name=cfg.CORRUPTION.DATASET)
-    # base_model = get_model(cfg, num_classes)
 
     logger.info(f"Setting up test-time adaptation method: {cfg.MODEL.ADAPTATION.upper()}")
     if cfg.MODEL.ADAPTATION == "source":  # BN--0
-        raise ValueError("----- 今はsourceは対応していないよ -----")
-        model, param_names = setup_source(base_model)
+        model = setup_source()
     elif cfg.MODEL.ADAPTATION == "rmt":
-        # model, param_names = setup_rmt(base_model, num_classes)
         model = setup_rmt(num_classes)
     else:
         raise ValueError(f"Adaptation method '{cfg.MODEL.ADAPTATION}' is not supported!")
@@ -125,10 +123,11 @@ def evaluate(description):
         eval_domain_dict(domain_dict, domain_seq=cfg.CORRUPTION.TYPE)
 
 
-def setup_source(model):
+def setup_source():
     """Set up BN--0 which uses the source model without any adaptation."""
+    model = SourceOnlyCLIP()
     model.eval()
-    return model, None
+    return model
 
 
 def setup_rmt(num_classes):

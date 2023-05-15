@@ -1,20 +1,20 @@
 import logging
 
+from easydict import EasyDict
 import os
+import numpy as np
 import tqdm
 import torch
 import torch.nn as nn
 import torch.jit
 import torch.nn.functional as F
+import torchvision
+import clip
 
+from domainbed import networks
 from methods.base import TTAMethod
 from models.model import split_up_model
 from augmentations.transforms_cotta import get_tta_transforms
-import clip
-from domainbed import networks
-from easydict import EasyDict
-import numpy as np
-
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +37,7 @@ class RMT(TTAMethod):
 
         self.hparams = EasyDict({
             "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
+            # classnameのリストは，cifar10 = torcivision.datasets.CIFAR10 でインスタンスを作成し，cifar10.classesで取得できる.
             "class_names": sorted(["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truc"]),
             "num_domain_tokens": 16,
             "sentence_prompt": True, ####### 独自に追加.
@@ -172,9 +173,7 @@ class RMT(TTAMethod):
         for param in self.clip_model.parameters():
             param.requires_grad = False
         
-        classnames = [name.replace('_', ' ') for name in self.hparams['class_names']]
-        self.prompt = torch.cat([clip.tokenize(f'a photo of a {ppt}') for ppt in classnames]).to(self.device)  # (クラス数, 77)
-        
+
         ##### class DPLCLIP(CLIP): #####
         #  initial prompt.
         prompt_prefix = ' '.join(['X'] * self.hparams['num_domain_tokens'])
