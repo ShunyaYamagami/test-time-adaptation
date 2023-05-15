@@ -274,6 +274,7 @@ class RMT(TTAMethod):
         _mean_domain_features_ema = mean_domain_features_ema.repeat_interleave(len(self.hparams['class_names']), dim=0)  # (Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
         
         # Text Features
+        # prefix + domain_features + suffix(=CLS, EOS) である Text Featuresを作成する.
         text_features = self._get_text_features(_mean_domain_features)  # (Sourceクラス数, EMBEDDING_DIM)
         text_features_ema = self._get_text_features(_mean_domain_features_ema)  # (Sourceクラス数, EMBEDDING_DIM)
 
@@ -298,11 +299,11 @@ class RMT(TTAMethod):
         # self.token_prefix.shape:  SOS (Sourceクラス数, 1, EMBEDDING_DIM)
         # domain_feature         :  CLS (Sourceクラス数, self.hparams['num_domain_tokens'], EMBEDDING_DIM))
         # self.token_suffix.shape:  EOS (Sourceクラス数, 77 - 1 - self.hparams['num_domain_tokens'], EMBEDDING_DIM)
-        domain_feature = torch.cat([self.token_prefix, domain_feature, self.token_suffix], dim=1)  # (Sourceクラス数, 77, EMBEDDING_DIM)
+        prompts_with_domain_features = torch.cat([self.token_prefix, domain_feature, self.token_suffix], dim=1)  # (Sourceクラス数, 77, EMBEDDING_DIM)
         
         # refer CoOp: CoOP github. https://github.com/KaiyangZhou/CoOp/blob/b0a058869cef00a4e4ea5256d40fd7681119c099/trainers/coop.py#L46
         # domain_featureに位置エンコーディングを加え，位置情報をembedding空間に反映する．
-        x = domain_feature + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (Sourceクラス数, 77, EMBEDDING_DIM)
+        x = prompts_with_domain_features + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (Sourceクラス数, 77, EMBEDDING_DIM)
         x = x.permute(1, 0, 2)  # (77, Sourceクラス数, EMBEDDING_DIM)
         x = self.clip_model.transformer(x)  # (77, Sourceクラス数, EMBEDDING_DIM)
         x = x.permute(1, 0, 2)  # (Sourceクラス数, 77, EMBEDDING_DIM)
