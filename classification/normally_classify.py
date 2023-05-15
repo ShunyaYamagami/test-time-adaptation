@@ -12,6 +12,7 @@ import torch.jit
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
 
 from robustbench.model_zoo.enums import ThreatModel
 from robustbench.utils import load_model
@@ -25,17 +26,8 @@ class NormalCLIP(nn.Module):
         self.hparams = EasyDict({
             "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
             "class_names": class_names,
-            "num_domain_tokens": 16,
-            'mlp_depth': 3,
-            'mlp_width': 512,
-            'mlp_dropout': 0.1,
-            'lr': 1e-3,
-            'momentum': 0.1,
-            'weight_decay': 0.,
-            "load_warmup_model": False  ######### 今は毎回warmupしよう.
         })
         self.set_clip_models()
-
 
     def set_clip_models(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -46,12 +38,10 @@ class NormalCLIP(nn.Module):
         for param in self.clip_model.parameters():
             param.requires_grad = False
         
-        ##### class DPLCLIP(CLIP): #####
         classnames = [f"a photo of a {name.replace('_', ' ')}" for name in self.hparams['class_names']]
         self.tokenized_prompts = torch.cat([clip.tokenize(c) for c in classnames]).to(self.device)
         self.text_features = self.clip_model.encode_text(self.tokenized_prompts)
         self.text_features /= self.text_features.norm(dim=-1, keepdim=True)
-
 
     def forward(self, x):
         image_features = self.clip_model.encode_image(x)
@@ -82,9 +72,17 @@ def get_dataloader(dataset_name="cifar10", does_resize = True):
         "num_workers": 4,
     })
     if does_resize:
-        transform = transforms.Compose([transforms.Resize(224),transforms.ToTensor()])
+        # refer clip.load preprocess
+        transform = transforms.Compose([
+            # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
+            transforms.Resize(224),
+            # transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        ])
     else:
         transform = transforms.Compose([transforms.ToTensor()])
+        # transform = None
     
     if dataset_name == "cifar10":
         source_dataset = torchvision.datasets.CIFAR10(root=dparams.root_dir, train=dparams.train_split, download=True, transform=transform)
@@ -113,7 +111,7 @@ def evaluation(model, dataloader, model_name="clip", cuda_i=0):
 
 
 if __name__ == '__main__':
-    dataset_name = "cifar10"
+    dataset_name = "cifar100"
     print(f"----- dataset: {dataset_name} -----")
     clip_dataset, clip_loader = get_dataloader(dataset_name, does_resize = True)
     vit_dataset, vit_loader   = get_dataloader(dataset_name, does_resize = False)
