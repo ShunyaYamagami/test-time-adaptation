@@ -47,8 +47,10 @@ class RMT(TTAMethod):
             'lr': 1e-3,
             'momentum': 0.1,
             'weight_decay': 0.,
-            "load_warmup_model": False  ######### 今は毎回warmupしよう.
+            "load_prototypes": True,  #########
+            "load_warmup_model": True,  #########
         })
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.set_clip_models()
         self._set_student_teacher_models()
 
@@ -71,6 +73,7 @@ class RMT(TTAMethod):
 
         self.tta_transform = get_tta_transforms(self.dataset_name)
 
+        ########## Prototypes ##########
         # define the prototype paths
         proto_dir_path = os.path.join(ckpt_dir, "prototypes")
         if self.dataset_name == "domainnet126":
@@ -80,11 +83,10 @@ class RMT(TTAMethod):
         fname = os.path.join(proto_dir_path, fname)
 
         # get source prototypes
-        if os.path.exists(fname):
+        if self.hparams['load_prototypes'] and os.path.exists(fname):
             logger.info(f"Loading class-wise source prototypes from {fname}...")
             self.prototypes_src = torch.load(fname)
         else:
-            raise ValueError("----- 今の所こっちは使わないので，使わない事を分かりやすくするためだけにエラーを出しておく -----")
             os.makedirs(proto_dir_path, exist_ok=True)
             features_src = torch.tensor([])
             labels_src = torch.tensor([])
@@ -92,8 +94,8 @@ class RMT(TTAMethod):
             with torch.no_grad():
                 for data in tqdm.tqdm(self.src_loader):
                     x, y = data[0], data[1]
-                    tmp_features = self.feature_extractor(x.cuda())
-                    features_src = torch.cat([features_src, tmp_features.view(tmp_features.shape[:2]).cpu()], dim=0)
+                    tmp_features = self.clip_model.encode_image(x.to(self.device))  # (B, EMBEDDING_DIM)
+                    features_src = torch.cat([features_src, tmp_features.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
                     labels_src = torch.cat([labels_src, y], dim=0)
                     if len(features_src) > 100000:
                         break
@@ -106,32 +108,32 @@ class RMT(TTAMethod):
 
             torch.save(self.prototypes_src, fname)
 
-        self.prototypes_src = self.prototypes_src.cuda().unsqueeze(1)
-        self.prototype_labels_src = torch.arange(start=0, end=self.num_classes, step=1).cuda().long()
-
+        self.prototypes_src = self.prototypes_src.to(self.device).unsqueeze(1)  # (クラス数，1, EMBEDDING_DIM)
+        self.prototype_labels_src = torch.arange(start=0, end=self.num_classes, step=1).to(self.device).long()  # (クラス数)
         # setup projector
         if self.dataset_name == "domainnet126":
             # do not use a projector since the network already clusters the features and reduces the dimensions
             self.projector = nn.Identity()
         else:
             num_channels = self.prototypes_src.shape[-1]
-            self.projector = nn.Sequential(nn.Linear(num_channels, self.projection_dim), nn.ReLU(),
-                                           nn.Linear(self.projection_dim, self.projection_dim)).cuda()
+            self.projector = nn.Sequential(nn.Linear(num_channels, self.projection_dim),
+                                           nn.ReLU(),
+                                           nn.Linear(self.projection_dim, self.projection_dim)).to(self.device)
             self.optimizer.add_param_group({'params': self.projector.parameters(), 'lr': self.optimizer.param_groups[0]["lr"]})
 
+        ########## Warm Up ##########
         # warm up the mean-teacher framework
         if self.warmup_steps > 0:
             warmup_ckpt_path = os.path.join(ckpt_dir, "warmup")
             if self.dataset_name == "domainnet126":
                 source_domain = ckpt_path.split(os.sep)[-1].split('_')[1]
-                ckpt_path = f"ckpt_warmup_{self.dataset_name}_{source_domain}_{arch_name}_bs{self.src_loader.batch_size}.pth"
+                ckpt_path = f"ckpt_warmup_{self.dataset_name}_{source_domain}_{arch_name}_bs{self.src_loader.batch_size}_step{self.warmup_steps}.pth"
             else:
-                ckpt_path = f"ckpt_warmup_{self.dataset_name}_{arch_name}_bs{self.src_loader.batch_size}.pth"
+                ckpt_path = f"ckpt_warmup_{self.dataset_name}_{arch_name}_bs{self.src_loader.batch_size}_step{self.warmup_steps}.pth"
             ckpt_path = os.path.join(warmup_ckpt_path, ckpt_path)
             
             if self.hparams['load_warmup_model'] and os.path.exists(ckpt_path):
-                raise ValueError("----- 今の所WarmUpは毎回したいので, ここでWarmUpモデルのロードはしない. 使わない事を分かりやすくするためだけにエラーを出しておく -----")
-                logger.info("Loading warmup checkpoint...")
+                logger.info(f"Loading warmup checkpoint... from {ckpt_path}")
                 checkpoint = torch.load(ckpt_path)
                 self.model.load_state_dict(checkpoint["model"])
                 self.model_ema.load_state_dict(checkpoint["model_ema"])
@@ -152,7 +154,6 @@ class RMT(TTAMethod):
 
 
     def set_clip_models(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # embedding dim for image and text encoder.
         self.EMBEDDING_DIM = 512
         print(f"----- self.hparams['clip_backbone'] : {self.hparams['clip_backbone']}  -----")
@@ -236,7 +237,7 @@ class RMT(TTAMethod):
                 batch = next(self.src_loader_iter)
 
             imgs_src, labels_src = batch[0], batch[1]
-            imgs_src, labels_src = imgs_src.cuda(), labels_src.cuda().long()
+            imgs_src, labels_src = imgs_src.to(self.device), labels_src.to(self.device).long()
 
             logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_src, labels_src)
             loss = symmetric_cross_entropy(logits_per_image, logits_per_image_ema).mean(0)

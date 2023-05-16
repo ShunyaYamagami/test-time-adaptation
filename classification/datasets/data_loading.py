@@ -2,6 +2,7 @@ import os
 import logging
 import random
 import numpy as np
+from PIL import Image
 
 import torch
 import torchvision
@@ -18,6 +19,19 @@ from augmentations.transforms_adacontrast import get_augmentation_versions, get_
 
 logger = logging.getLogger(__name__)
 
+
+def get_jigsaw(im:Image, grid=3) -> Image:
+    im = im.copy()
+    im_edge = im.size[0]
+    s = int(im_edge / grid)
+    tile = [im.crop(np.array([s * (n % grid), s * int(n / grid), s * (n % grid + 1), s * (int(n / grid) + 1)]).astype(int)) for n in range(grid**2)]
+    random.shuffle(tile)
+    dst = Image.new('RGB', (int(s * grid), int(s * grid)))
+    for i, t in enumerate(tile):
+        dst.paste(t, (i % grid * s, int(i / grid) * s))
+    im = dst
+
+    return im
 
 def get_transform(dataset_name, adaptation):
     """
@@ -44,6 +58,7 @@ def get_transform(dataset_name, adaptation):
         if dataset_name in {"cifar10", "cifar100"}:
             # refer clip.load preprocess
             transform = transforms.Compose([
+                # transforms.Lambda(get_jigsaw),
                 # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
                 transforms.Resize(224),
                 # transforms.CenterCrop(224),
@@ -53,6 +68,7 @@ def get_transform(dataset_name, adaptation):
         elif dataset_name in {"cifar10_c", "cifar100_c"}:
             # refer clip.load preprocess
             transform = transforms.Compose([
+                # transforms.Lambda(get_jigsaw),
                 # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
                 transforms.Resize(224),
                 # transforms.CenterCrop(224),
