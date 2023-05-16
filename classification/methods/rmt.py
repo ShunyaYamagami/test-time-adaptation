@@ -49,6 +49,7 @@ class RMT(TTAMethod):
             'weight_decay': 0.,
             "load_prototypes": True,  #########
             "load_warmup_model": True,  #########
+            "use_contrastive_loss": True,  #########
         })
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.set_clip_models()
@@ -239,7 +240,7 @@ class RMT(TTAMethod):
             imgs_src, labels_src = batch[0], batch[1]
             imgs_src, labels_src = imgs_src.to(self.device), labels_src.to(self.device).long()
 
-            logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_src, labels_src)
+            _, logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_src, labels_src)
             loss = symmetric_cross_entropy(logits_per_image, logits_per_image_ema).mean(0)
             loss.backward()
             self.optimizer.step()
@@ -283,7 +284,7 @@ class RMT(TTAMethod):
         logits_per_image = self.clip_model.logit_scale.exp() * image_features @ text_features.t()  # (B, Sourceクラス数)
         logits_per_image_ema = self.clip_model.logit_scale.exp() * image_features @ text_features_ema.t()  # (B, Sourceクラス数)
         
-        return logits_per_image, logits_per_image_ema
+        return image_features, logits_per_image, logits_per_image_ema
 
             
     def _get_text_features(self, domain_feature, coop=False):
@@ -373,51 +374,39 @@ class RMT(TTAMethod):
         imgs_test_aug = self.tta_transform((imgs_test))
 
         self.optimizer.zero_grad()
-        ###########################################################################################
-        ###########################################################################################
-        # # forward original test data
-        # features_test = self.feature_extractor(imgs_test)
-        # outputs_test = self.classifier(features_test)
 
-        # # forward augmented test data
-        # features_aug_test = self.feature_extractor(self.tta_transform((imgs_test)))
-        # outputs_aug_test = self.classifier(features_aug_test)
-
-        # # forward original test data through the ema model
-        # outputs_ema = self.model_ema(imgs_test)
-
-        ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
-        # with torch.no_grad():
-        #     # dist[:, i] contains the distance from every source sample to one test sample
-        #     # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
-        #     dist = F.cosine_similarity(
-        #         x1=self.prototypes_src.repeat(1, features_test.shape[0], 1),
-        #         x2=features_test.view(1, features_test.shape[0], features_test.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
-        #         dim=-1)
-
-        #     # for every test feature, get the nearest source prototype and derive the label
-        #     # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
-        #     _, indices = dist.topk(1, largest=True, dim=0)
-        #     indices = indices.squeeze(0)
-
-        # features = torch.cat([self.prototypes_src[indices],
-        #                       features_test.view(features_test.shape[0], 1, features_test.shape[1]),
-        #                       features_aug_test.view(features_test.shape[0], 1, features_test.shape[1])], dim=1)
-        # # 式(7)
-        # loss_contrastive = self.contrastive_loss(features=features, labels=None)
-        # # 式(6)
-        # loss_entropy = self_training(x=outputs_test, x_aug=outputs_aug_test, x_ema=outputs_ema).mean(0)
-        # # 式(9)のうち, targetドメインに対するLoss (第1,2項)
-        # loss_trg = self.lambda_ce_trg * loss_entropy + self.lambda_cont * loss_contrastive
-        # loss_trg.backward()
-        #########################################################################################
-        #########################################################################################
-        logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_test)
-        logits_per_image_aug, _ = self._calc_clip_logits(imgs_test_aug)
-
+        features_test, logits_per_image, logits_per_image_ema = self._calc_clip_logits(imgs_test)
+        features_aug_test, logits_per_image_aug, _ = self._calc_clip_logits(imgs_test_aug)
+        ##### Self Training
+        # 式(6)
         loss_entropy = self_training(x=logits_per_image, x_aug=logits_per_image_aug, x_ema=logits_per_image_ema).mean(0)
-        # loss_trg = self.lambda_ce_trg * loss_entropy + self.lambda_cont * loss_contrastive
-        loss_trg = loss_entropy
+        # 式(9)のうち, targetドメインに対するLoss (第1項)
+        loss_trg = self.lambda_ce_trg * loss_entropy
+        
+        if self.hparams["use_contrastive_loss"]:
+            ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
+            with torch.no_grad():
+                # dist[:, i] contains the distance from every source sample to one test sample
+                # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
+                dist = F.cosine_similarity(
+                    x1=self.prototypes_src.repeat(1, features_test.shape[0], 1),
+                    x2=features_test.view(1, features_test.shape[0], features_test.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
+                    dim=-1)  # (クラス数, B)
+
+                # for every test feature, get the nearest source prototype and derive the label
+                # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
+                _, indices = dist.topk(1, largest=True, dim=0)  # (1, B)
+                print(f"indices.shape: {indices.shape}")
+                indices = indices.squeeze(0)  # (B,)
+
+            features = torch.cat([self.prototypes_src[indices],
+                                features_test.view(features_test.shape[0], 1, features_test.shape[1]),
+                                features_aug_test.view(features_test.shape[0], 1, features_test.shape[1])], dim=1)  # (B, 3, EMBEDDING_DIM)
+            # 式(7)
+            loss_contrastive = self.contrastive_loss(features=features, labels=None)
+            # 式(9)のうち, targetドメインに対するLoss (第2項)
+            loss_trg += self.lambda_cont * loss_contrastive
+
         loss_trg.backward()
 
         if self.lambda_ce_src > 0:
