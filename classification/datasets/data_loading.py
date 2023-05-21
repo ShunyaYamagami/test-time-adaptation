@@ -16,22 +16,8 @@ from datasets.imagenet_d_utils import create_symlinks_and_get_imagenet_visda_map
 from datasets.imagenet_dict import map_dict
 from augmentations.transforms_adacontrast import get_augmentation_versions, get_augmentation
 
-
 logger = logging.getLogger(__name__)
 
-
-def get_jigsaw(im:Image, grid=3) -> Image:
-    im = im.copy()
-    im_edge = im.size[0]
-    s = int(im_edge / grid)
-    tile = [im.crop(np.array([s * (n % grid), s * int(n / grid), s * (n % grid + 1), s * (int(n / grid) + 1)]).astype(int)) for n in range(grid**2)]
-    random.shuffle(tile)
-    dst = Image.new('RGB', (int(s * grid), int(s * grid)))
-    for i, t in enumerate(tile):
-        dst.paste(t, (i % grid * s, int(i / grid) * s))
-    im = dst
-
-    return im
 
 def get_transform(dataset_name, adaptation):
     """
@@ -56,26 +42,17 @@ def get_transform(dataset_name, adaptation):
     else:
         # create non-method specific transformation
         if dataset_name in {"cifar10", "cifar100"}:
-            # refer clip.load preprocess
             transform = transforms.Compose([
-                # transforms.Lambda(get_jigsaw),
-                # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
                 transforms.Resize(224),
-                # transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
             ])
+            # transform = None  # このtransformをNoneにするのは, 後からイテレーションを実行する度にtransformするからだ．でないと，正規のtransformをここで指定すると，後々クラス破壊のtransformができない (ToPILTensorを使って後から)
         elif dataset_name in {"cifar10_c", "cifar100_c"}:
-            # refer clip.load preprocess
             transform = transforms.Compose([
-                # transforms.Lambda(get_jigsaw),
-                # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
                 transforms.Resize(224),
-                # transforms.CenterCrop(224),
                 transforms.ToTensor(),
-                transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
             ])
-            # transform = None
+            # transform = None  # このtransformをNoneにするのは, 後からイテレーションを実行する度にtransformするからだ．でないと，正規のtransformをここで指定すると，後々クラス破壊のtransformができない (ToPILTensorを使って後から)
         elif dataset_name == "imagenet_c":
             # note that ImageNet-C is already resized and centre cropped
             transform = transforms.Compose([transforms.ToTensor()])

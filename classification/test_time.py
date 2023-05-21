@@ -89,6 +89,7 @@ def evaluate(description):
         #     logger.warning("not resetting model")
 
         for severity in severities:
+            logger.info(f"----- get_test_loader -----")
             test_data_loader = get_test_loader(setting=cfg.SETTING,
                                                adaptation=cfg.MODEL.ADAPTATION,
                                                dataset_name=cfg.CORRUPTION.DATASET,
@@ -102,6 +103,7 @@ def evaluate(description):
                                                shuffle=False,
                                                workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count()))
 
+            logger.info(f"----- get_accuracy -----")
             acc, domain_dict = get_accuracy(
                 model, data_loader=test_data_loader, dataset_name=cfg.CORRUPTION.DATASET,
                 domain_name=domain_name, setting=cfg.SETTING, domain_dict=domain_dict)
@@ -158,7 +160,8 @@ def setup_rmt(num_classes):
                     lambda_ce_trg=cfg.RMT.LAMBDA_CE_TRG,
                     lambda_cont=cfg.RMT.LAMBDA_CONT,
                     m_teacher_momentum=cfg.M_TEACHER.MOMENTUM,
-                    num_samples_warm_up=cfg.RMT.NUM_SAMPLES_WARM_UP)
+                    num_samples_warm_up=cfg.RMT.NUM_SAMPLES_WARM_UP,
+                    save_dir = cfg.SAVE_DIR)
     # return rmt_model, param_names
     return rmt_model
 

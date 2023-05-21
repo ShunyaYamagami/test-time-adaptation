@@ -4,21 +4,13 @@ from easydict import EasyDict
 import numpy as np
 from tqdm import tqdm
 import os
-
 import torch
-import torch.optim as optim
 import torch.nn as nn
-import torch.jit
-import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as transforms
-from torchvision.transforms import InterpolationMode
 
-from robustbench.model_zoo.enums import ThreatModel
-from robustbench.utils import load_model
-from models.model import split_up_model
 import clip
 
+from prc_functions.dataloader import get_dataloader
+from prc_functions.vit_model import get_vit_model
 
 class NormalCLIP(nn.Module):
     def __init__(self, class_names):
@@ -49,51 +41,6 @@ class NormalCLIP(nn.Module):
         logits_per_image = self.clip_model.logit_scale.exp() * image_features @ self.text_features.t()  # (B, Sourceクラス数)
         return logits_per_image
     
-
-def get_vit_model(dataset_name="cifar10"):
-    """ ベースとなるpre-trained model(ViTなど)をロード. """
-    print("----- loading base_model from model_zoo -----")
-    if dataset_name == "cifar10":
-        arch = "Standard"
-    elif dataset_name == "cifar100":
-        arch = "Hendrycks2020AugMix_ResNeXt"
-    else:
-        raise NotImplementedError(f"dataset_name: {dataset_name} is not implemented.")
-    base_model = load_model(arch, "./ckpt", dataset_name, ThreatModel.corruptions)
-
-    return base_model
-
-
-def get_dataloader(dataset_name="cifar10", does_resize = True):
-    dparams = EasyDict({
-        "root_dir": "/nas/data/syamagami/tta/rmt",
-        "train_split": False,
-        "batch_size": 200,
-        "num_workers": 4,
-    })
-    if does_resize:
-        # refer clip.load preprocess
-        transform = transforms.Compose([
-            # transforms.Resize(224, interpolation=InterpolationMode.BICUBIC),
-            transforms.Resize(224),
-            # transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
-        ])
-    else:
-        transform = transforms.Compose([transforms.ToTensor()])
-        # transform = None
-    
-    if dataset_name == "cifar10":
-        source_dataset = torchvision.datasets.CIFAR10(root=dparams.root_dir, train=dparams.train_split, download=True, transform=transform)
-    elif dataset_name == "cifar100":
-        source_dataset = torchvision.datasets.CIFAR100(root=dparams.root_dir, train=dparams.train_split, download=True, transform=transform)
-    else:
-        raise NotImplementedError(f"dataset_name: {dataset_name} is not implemented.")
-
-    source_loader = torch.utils.data.DataLoader(source_dataset, batch_size=dparams.batch_size, shuffle=True, num_workers=dparams.num_workers, drop_last=False)
-    return source_dataset, source_loader
-
     
 def evaluation(model, dataloader, model_name="clip", cuda_i=0):
     correct = 0.

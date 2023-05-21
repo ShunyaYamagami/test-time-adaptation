@@ -1,4 +1,5 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +10,10 @@ import torchvision.models
 from domainbed.lib import big_transfer
 from domainbed.lib import vision_transformer
 from domainbed.lib import mlp_mixer
-
 import clip
+
+logger = logging.getLogger(__name__)
+
 
 def remove_batch_norm_from_resnet(model):
     fuse = torch.nn.utils.fusion.fuse_conv_bn_eval
@@ -57,25 +60,33 @@ class SqueezeLastTwo(nn.Module):
 class MLP(nn.Module):
     """Just  an MLP"""
     def __init__(self, n_inputs, n_outputs, hparams):
-        super(MLP, self).__init__()
-        self.input = nn.Linear(n_inputs, hparams['mlp_width'])
-        self.dropout = nn.Dropout(hparams['mlp_dropout'])
-        self.hiddens = nn.ModuleList([
-            nn.Linear(hparams['mlp_width'],hparams['mlp_width'])
-            for _ in range(hparams['mlp_depth']-2)])
-        self.output = nn.Linear(hparams['mlp_width'], n_outputs)
-        self.n_outputs = n_outputs
+        super().__init__()
+        hidden_modules = []
+        for _ in range(hparams['mlp_depth']-2):
+            hidden_modules += [
+                    nn.Linear(hparams['mlp_width'], hparams['mlp_width']),
+                    nn.Dropout(hparams['mlp_dropout']),
+                    nn.BatchNorm1d(hparams['mlp_width']),
+                    # nn.ReLU()
+                    nn.ELU()
+                ]
+        hidden_sequence = nn.Sequential(*hidden_modules)
+
+        self.sequence = nn.Sequential(
+            nn.Linear(n_inputs, hparams['mlp_width']),
+            nn.Dropout(hparams['mlp_dropout']),
+            nn.BatchNorm1d(hparams['mlp_width']),
+            # nn.ReLU(),
+            nn.ELU(),
+            hidden_sequence,
+            nn.Linear(hparams['mlp_width'], n_outputs),
+            nn.BatchNorm1d(n_outputs),
+            nn.ELU(),
+        )
 
     def forward(self, x):
-        x = self.input(x)
-        x = self.dropout(x)
-        x = F.relu(x)
-        for hidden in self.hiddens:
-            x = hidden(x)
-            x = self.dropout(x)
-            x = F.relu(x)
-        x = self.output(x)
-        return x
+        out = self.sequence(x)
+        return out
 
 
 class ResNet(torch.nn.Module):
@@ -240,7 +251,7 @@ def Featurizer(input_shape, hparams):
 class CLIP_Featurizer(nn.Module):
     def __init__(self, hparams):
         super().__init__()
-        print(hparams['clip_backbone'])
+        logger.info(hparams['clip_backbone'])
         # RN50 -> 1024
         # RN50x4 -> 640
         # RN50x16 -> 768
@@ -248,7 +259,7 @@ class CLIP_Featurizer(nn.Module):
         if hparams['clip_backbone'] not in ['ViT-B/32', 'ViT-B/16', 'RN101']:
             raise ValueError('Unknown clip_backbone: {}'.format(hparams['clip_backbone']))
         
-        print(f'Using {hparams["clip_backbone"]}...')
+        logger.info(f'Using {hparams["clip_backbone"]}...')
         self.clip_model = clip.load(hparams["clip_backbone"])[0].float()
         self.n_outputs = 512
     
