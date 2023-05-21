@@ -22,7 +22,8 @@ class NormalCLIP(nn.Module):
         self.set_clip_models()
 
     def set_clip_models(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.device = "cpu"
         print(f"----- self.hparams['clip_backbone'] : {self.hparams['clip_backbone']}  -----")
         self.clip_model, preprocess = clip.load(self.hparams['clip_backbone'], device=self.device)
         # CLIPモデルのパラメータは更新させない
@@ -49,7 +50,7 @@ def evaluation(model, dataloader, model_name="clip", cuda_i=0):
     len_dataloader = len(dataloader)
     print(f"dataloader: {len_dataloader}")
     for i, (imgs, labels) in tqdm(enumerate(dataloader)):
-        imgs, labels = imgs.to(f"cuda:{cuda_i}"), labels.to(f"cuda:{cuda_i}")
+        imgs, labels = imgs.to(f"cpu"), labels.to(f"cpu")
         output = model(imgs)
         pred = output.argmax(dim=1)
         correct += (pred == labels).float().sum()
@@ -60,16 +61,17 @@ def evaluation(model, dataloader, model_name="clip", cuda_i=0):
 if __name__ == '__main__':
     dataset_name = "cifar10"
     print(f"----- dataset: {dataset_name} -----")
+    print(f"----- CLIP -----")
     clip_dataset, clip_loader = get_dataloader(dataset_name, does_resize = True)
-    vit_dataset, vit_loader   = get_dataloader(dataset_name, does_resize = False)
     class_names = clip_dataset.classes
-
     clip_model = NormalCLIP(class_names)
     clip_model.eval()
+    evaluation(clip_model, clip_loader, model_name="clip", cuda_i=0)
+
+    print(f"----- ViT -----")
+    vit_dataset, vit_loader = get_dataloader(dataset_name, does_resize = False)
     vit_model = get_vit_model(dataset_name)
-    vit_model = vit_model.to("cuda:1")
+    vit_model = vit_model.to(f"cpu")
     vit_model.eval()
     # feature_extractor, classifier = split_up_model(vit_model, "Standard", "cifar10")
-
-    evaluation(clip_model, clip_loader, model_name="clip", cuda_i=0)
     evaluation(vit_model, vit_loader, model_name="vit", cuda_i=1)

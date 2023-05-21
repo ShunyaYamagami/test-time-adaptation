@@ -7,7 +7,7 @@ import torch.nn as nn
 
 from models.model import get_model
 from utils import get_accuracy, eval_domain_dict
-from conf import cfg, load_cfg_fom_args, get_num_classes, get_domain_sequence
+from conf import cfg, load_cfg_fom_args, get_num_classes, get_domain_sequence, set_hparams
 from datasets.data_loading import get_source_loader, get_test_loader
 
 from methods.source_only_clip import SourceOnlyCLIP
@@ -41,13 +41,13 @@ def evaluate(description):
                            "reset_each_shift_correlated"
                            ]
 
-    num_classes = get_num_classes(dataset_name=cfg.CORRUPTION.DATASET)
+    hparams = set_hparams()
 
     logger.info(f"Setting up test-time adaptation method: {cfg.MODEL.ADAPTATION.upper()}")
     if cfg.MODEL.ADAPTATION == "source":  # BN--0
         model = setup_source()
     elif cfg.MODEL.ADAPTATION == "rmt":
-        model = setup_rmt(num_classes)
+        model = setup_rmt(hparams)
     else:
         raise ValueError(f"Adaptation method '{cfg.MODEL.ADAPTATION}' is not supported!")
 
@@ -89,7 +89,6 @@ def evaluate(description):
         #     logger.warning("not resetting model")
 
         for severity in severities:
-            logger.info(f"----- get_test_loader -----")
             test_data_loader = get_test_loader(setting=cfg.SETTING,
                                                adaptation=cfg.MODEL.ADAPTATION,
                                                dataset_name=cfg.CORRUPTION.DATASET,
@@ -101,9 +100,9 @@ def evaluate(description):
                                                alpha_dirichlet=cfg.TEST.ALPHA_DIRICHLET,
                                                batch_size=cfg.TEST.BATCH_SIZE,
                                                shuffle=False,
-                                               workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count()))
+                                               workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count()),
+                                                clip_task_specific=hparams.clip_model.task_specific)
 
-            logger.info(f"----- get_accuracy -----")
             acc, domain_dict = get_accuracy(
                 model, data_loader=test_data_loader, dataset_name=cfg.CORRUPTION.DATASET,
                 domain_name=domain_name, setting=cfg.SETTING, domain_dict=domain_dict)
@@ -132,7 +131,7 @@ def setup_source():
     return model
 
 
-def setup_rmt(num_classes):
+def setup_rmt(hparams):
     # ここでいうmodel: pre-trained model(e.g. ViT)
     # model = RMT.configure_model(model)
     # params, param_names = RMT.collect_params(model)
@@ -140,16 +139,20 @@ def setup_rmt(num_classes):
     
     batch_size_src = cfg.TEST.BATCH_SIZE if cfg.TEST.BATCH_SIZE > 1 else cfg.TEST.WINDOW_LENGTH
     _, src_loader = get_source_loader(dataset_name=cfg.CORRUPTION.DATASET,
-                                      root_dir=cfg.DATA_DIR, adaptation=cfg.MODEL.ADAPTATION,
-                                      batch_size=batch_size_src, ckpt_path=cfg.CKPT_PATH, percentage=cfg.SOURCE.PERCENTAGE,
-                                      workers=min(cfg.SOURCE.NUM_WORKERS, os.cpu_count()))
+                                      root_dir=cfg.DATA_DIR,
+                                      adaptation=cfg.MODEL.ADAPTATION,
+                                      batch_size=batch_size_src,
+                                      ckpt_path=cfg.CKPT_PATH,
+                                      percentage=cfg.SOURCE.PERCENTAGE,
+                                      workers=min(cfg.SOURCE.NUM_WORKERS, os.cpu_count()),
+                                      clip_task_specific=hparams.clip_model.task_specific)
     rmt_model = RMT(
+                    hparams=hparams,
                     steps=cfg.OPTIM.STEPS,
                     episodic=cfg.MODEL.EPISODIC,
                     window_length=cfg.TEST.WINDOW_LENGTH,
                     dataset_name=cfg.CORRUPTION.DATASET,
                     arch_name=cfg.MODEL.ARCH,
-                    num_classes=num_classes,
                     src_loader=src_loader,
                     ckpt_dir=cfg.CKPT_DIR,
                     ckpt_path=cfg.CKPT_PATH,
@@ -161,7 +164,8 @@ def setup_rmt(num_classes):
                     lambda_cont=cfg.RMT.LAMBDA_CONT,
                     m_teacher_momentum=cfg.M_TEACHER.MOMENTUM,
                     num_samples_warm_up=cfg.RMT.NUM_SAMPLES_WARM_UP,
-                    save_dir = cfg.SAVE_DIR)
+                    save_dir = cfg.SAVE_DIR,
+                    model_weights = cfg.MODEL.WEIGHTS,)
     # return rmt_model, param_names
     return rmt_model
 

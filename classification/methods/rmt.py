@@ -8,17 +8,21 @@ import torch
 import torch.nn as nn
 import torch.jit
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler
 import torchvision
 import torchvision.transforms as transforms
 from transformers import BertModel
 import clip
 from sinkhorn_knopp import sinkhorn_knopp as skp
 from sklearn.cluster import SpectralBiclustering
+import gc
 
+from conf import get_num_classes
 from domainbed import networks
 from methods.base import TTAMethod
 from augmentations.transforms_cotta import get_tta_transforms
 from augmentations.aug import get_transform_when_iteration
+from models.model import get_model, split_up_model
 from models.my_transformer import MyTransformer
 from models.mine import Mine, MineTrainer
 from loss.nt_xent import NTXentLoss
@@ -27,71 +31,39 @@ logger = logging.getLogger(__name__)
 
 
 class RMT(TTAMethod):
-    def __init__(self, steps, episodic, window_length, dataset_name, arch_name, num_classes, src_loader, ckpt_dir, ckpt_path,
-                 contrast_mode, temperature, projection_dim, lambda_ce_src, lambda_ce_trg, lambda_cont, m_teacher_momentum, num_samples_warm_up, save_dir):
+    def __init__(self, hparams, steps, episodic, window_length, dataset_name, arch_name, src_loader, ckpt_dir, ckpt_path,
+                 contrast_mode, temperature, projection_dim, lambda_ce_src, lambda_ce_trg, lambda_cont, m_teacher_momentum, num_samples_warm_up, save_dir, model_weights):
         super().__init__(steps, episodic, window_length)
         logger.info(f"----- RMT __init__ -----")
 
-        self.hparams = EasyDict({
-            "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
-            # classnameのリストは，cifar10 = torcivision.datasets.CIFAR10 でインスタンスを作成し，cifar10.classesで取得できる.
-            "class_names": sorted(["airplane", "automobile", "bird", "cat", "deer", "dog", "frog", "horse", "ship", "truc"]),
-            "num_domain_tokens": 16,
-            "sentence_prompt": True, ####### 独自に追加.
-            'mlp_depth': 3,
-            'mlp_width': 512,
-            'mlp_dropout': 0.1,
-            'lr': 1e-3,
-            'momentum': 0.1,
-            'weight_decay': 0.,
-            "base_model": {
-                "architecture": "mlp",
-                # "architecture": "my_transformer",
-                'pretrained': False,
-            },
-            "warmup": {
-                "use": False,
-                "load_model": False,
-            },
-            "prototypes": {
-                "use": False,
-                "load": False,
-            },
-            "domain_loss": {
-                "method": "mine",  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
-                # "method": False,  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
-                "nt_xent_temperature": 0.5,
-            },
-            "cuda_visible_devices": os.environ.get('CUDA_VISIBLE_DEVICES'),
-            "exec_num": os.environ.get('exec_num'),
-        })
+        self.hparams = hparams
         ####################################################################################
         ####################################################################################
-        ####################################################################################
-        if self.hparams["cuda_visible_devices"] == 0:
-            self.hparams["prototypes"]["use"] = False
-            self.hparams["domain_loss"]["method"] = False
-        elif self.hparams["cuda_visible_devices"] == 1:
-            self.hparams["prototypes"]["use"] = False
-            self.hparams["domain_loss"]["method"] = "mine"
-        elif self.hparams["cuda_visible_devices"] == 2:
-            self.hparams["prototypes"]["use"] = True
-            self.hparams["domain_loss"]["method"] = False
-        elif self.hparams["cuda_visible_devices"] == 3:
-            self.hparams["prototypes"]["use"] = True
-            self.hparams["domain_loss"]["method"] = "mine"
-        ##################
-        if self.hparams["exec_num"] == 2:
-            self.hparams["base_model"]["architecture"] = "my_transformer"
-        ####################################################################################
+        self.hparams["clip_model"]["task_specific"] = True
+        # if self.hparams["cuda_visible_devices"] == 0:
+        #     self.hparams["prototypes"]["use"] = False
+        #     self.hparams["domain_loss"]["method"] = False
+        # elif self.hparams["cuda_visible_devices"] == 1:
+        #     self.hparams["prototypes"]["use"] = False
+        #     self.hparams["domain_loss"]["method"] = "mine"
+        # elif self.hparams["cuda_visible_devices"] == 2:
+        #     self.hparams["prototypes"]["use"] = True
+        #     self.hparams["domain_loss"]["method"] = False
+        # elif self.hparams["cuda_visible_devices"] == 3:
+        #     self.hparams["prototypes"]["use"] = True
+        #     self.hparams["domain_loss"]["method"] = "mine"
+        # ###########
+        # if self.hparams["exec_num"] == 2:
+        #     self.hparams["base_model"]["architecture"] = "my_transformer"
         ####################################################################################
         ####################################################################################
 
+        assert self.hparams['optimizer'] in ['Adam', 'SGD']
         assert self.hparams['base_model']['architecture'] in ['mlp', 'my_transformer'], f'base_model must be "mlp" or "my_transformer", but got {self.hparams["base_model"]}'
         assert self.hparams['domain_loss']['method'] in [False, 'nt_xent', 'mine'], f"loss method must be False, 'nt_xent' or 'mine', but got {self.hparams['domain_loss']['method']}"
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
-        assert self.hparams['warmup']['use'] and self.warmup_steps > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
+        assert self.hparams['warmup']['use'] and num_samples_warm_up > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
 
         with open(os.path.join(save_dir, "hparams.yaml"), 'w') as file:
             yaml.dump(self.hparams, file, default_flow_style=False, sort_keys=False)
@@ -99,11 +71,14 @@ class RMT(TTAMethod):
         ########## Set Parameters ##########
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.EMBEDDING_DIM = 512
-
         self.dataset_name = dataset_name
-        self.num_classes = num_classes
+        self.arch_name = arch_name
+        self.class_names = src_loader.dataset.classes
+        self.num_classes = len(self.class_names)
         self.src_loader = src_loader
         self.src_loader_iter = iter(self.src_loader)
+        self.ckpt_dir = ckpt_dir
+        self.ckpt_path = ckpt_path
         self.contrast_mode = contrast_mode
         self.temperature = temperature
         self.base_temperature = self.temperature
@@ -113,22 +88,29 @@ class RMT(TTAMethod):
         self.lambda_cont = lambda_cont
         self.m_teacher_momentum = m_teacher_momentum
         self.save_dir = save_dir
+        self.model_weights = model_weights
         self.warmup_steps = num_samples_warm_up // self.src_loader.batch_size
         self.tta_transform = get_tta_transforms(self.dataset_name)
-        self.normal_transform, self.clsdst_transform = get_transform_when_iteration(grid=3)
+        self.normal_transform, self.clsdst_transform = get_transform_when_iteration(grid=4)
+        # 自動的にレイヤ毎に最適なビット精度を選択してくれる（convはfp16, bnはfp32等）. ベストプラクティスを選択してくれるため、便利。use_amp=Falseではfp32を使用する。
+        self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])
 
         ########## Set Models ##########
         self.set_clip_models()
+        if self.hparams['clip_model']['task_specific']:
+            input_dim = 640
+        else:
+            input_dim = self.EMBEDDING_DIM
         if self.hparams['base_model']['architecture'] == "mlp":
             self.base_model = networks.MLP(
+                input_dim,
                 self.EMBEDDING_DIM,
-                self.EMBEDDING_DIM * self.hparams['num_domain_tokens'],
                 self.hparams
             ).to(device=self.device, dtype=self.clip_model.dtype)
         elif self.hparams['base_model']['architecture'] == "my_transformer":
             self.base_model = MyTransformer(
-                width=self.EMBEDDING_DIM,
-                out_width = self.EMBEDDING_DIM * self.hparams['num_domain_tokens'],
+                width=input_dim,
+                out_width = self.EMBEDDING_DIM,
                 layers=12,
                 heads=8,
                 context_length=src_loader.batch_size,
@@ -136,13 +118,25 @@ class RMT(TTAMethod):
                 attn_mask="build_attention_mask"
             ).to(device=self.device, dtype=self.clip_model.dtype)
             
-        self.optimizer = torch.optim.SGD(
-            self.base_model.parameters(),
-            lr=self.hparams['lr'],
-            momentum=self.hparams['momentum']
-        )
         self._set_student_teacher_models() 
 
+        ########## Domain Loss ##########
+        if self.hparams["domain_loss"]["method"]:
+            self.domain_projector = nn.Sequential(nn.Linear(self.EMBEDDING_DIM, self.EMBEDDING_DIM * self.hparams['num_domain_tokens'])).cuda()
+            self.skp = skp.SinkhornKnopp()
+            n_clusters=(4, 3)
+            self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
+            assert self.hparams["domain_loss"]["method"] == "mine", "Only support mine for domain loss when _set_optimizer()"
+            if self.hparams["domain_loss"]["method"] == "mine":
+                self.mine_net = Mine().cuda()
+                self.mine_trainer = MineTrainer(self.mine_net)
+                self.optimizer, self.domain_optimizer = self._set_optimizer()
+                self.mine_trainer.mine_net_optim = self.domain_optimizer
+            elif self.hparams["domain_loss"]["method"] == "nt_xent":
+                self.domain_criterion = NTXentLoss(self.device, self.src_loader.batch_size, self.hparams["domain_loss"]["nt_xent_temperature"])
+        else:
+            self.optimizer = self._set_optimizer()
+        
         self.final_lr = self.optimizer.param_groups[0]["lr"]
 
         ########## Prototypes ##########
@@ -166,10 +160,9 @@ class RMT(TTAMethod):
                 with torch.no_grad():
                     for data in tqdm.tqdm(self.src_loader):
                         x, y = data[0], data[1]
-                        tmp_features = self.clip_model.encode_image(x.to(self.device))  # (B, EMBEDDING_DIM)
-                        # features_src = torch.cat([features_src, tmp_features.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
-                        base_features = self.base_model(tmp_features)
-                        student_features = self.model(base_features)  # (B, EMBEDDING_DIM)
+                        student_features = self._get_features(x.to(self.device), source=True)
+                        #####  TODO: このPrototypesは, プロンプト特徴量ベースでなく, 画像特徴量ベースで作成した方が良いのでは？
+                        #####  TODO: WarmUpの後にPrototypesを作成した方が良いのでは?
                         features_src = torch.cat([features_src, student_features.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
                         labels_src = torch.cat([labels_src, y], dim=0)
                         if len(features_src) > 100000:
@@ -182,7 +175,7 @@ class RMT(TTAMethod):
 
                 torch.save(self.prototypes_src, fname)
 
-                self.prototypes_src = self.prototypes_src.to(self.device).unsqueeze(1)  # (クラス数，1, EMBEDDING_DIM)
+                self.prototypes_src = self.prototypes_src.to(self.device).unsqueeze(1) 
                 self.prototype_labels_src = torch.arange(start=0, end=self.num_classes, step=1).to(self.device).long()  # (クラス数)
                 
             ########## Projector ##########
@@ -195,21 +188,6 @@ class RMT(TTAMethod):
                                             nn.ReLU(),
                                             nn.Linear(self.projection_dim, self.projection_dim)).to(self.device)
                 self.optimizer.add_param_group({'params': self.projector.parameters(), 'lr': self.optimizer.param_groups[0]["lr"]})
-
-
-        ########## Domain Loss ##########
-        if self.hparams["domain_loss"]["method"]:
-            self.skp = skp.SinkhornKnopp()
-            n_clusters=(4, 3)
-            self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
-            if self.hparams["domain_loss"]["method"] == "mine":
-                self.mine_net = Mine().cuda()
-                self.mine_trainer = MineTrainer(self.mine_net)
-                self.optimizer.add_param_group({'params': self.mine_net.parameters(), 'lr': self.optimizer.param_groups[0]["lr"]})
-                self.mine_trainer.mine_net_optim = self.optimizer
-            elif self.hparams["domain_loss"]["method"] == "nt_xent":
-                self.domain_criterion = NTXentLoss(self.device, self.src_loader.batch_size, self.hparams["domain_loss"]["nt_xent_temperature"])
-
 
         ########## Warm Up ##########
         # warm up the mean-teacher framework
@@ -230,6 +208,7 @@ class RMT(TTAMethod):
                 self.model_ema.load_state_dict(checkpoint["model_ema"])
                 if self.hparams["domain_loss"]["method"] == "mine":
                     self.mine_net.load_state_dict(checkpoint["mine_net"])
+                    self.domain_optimizer.load_state_dict(checkpoint["domain_optimizer"])
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
                 logger.info(f"Loaded from {ckpt_path}")
             else:
@@ -243,12 +222,14 @@ class RMT(TTAMethod):
                 }
                 if self.hparams["domain_loss"]["method"] == "mine":
                     model_dict["mine_net"] = self.mine_net.state_dict()
+                    model_dict["domain_optimizer"] = self.domain_optimizer.state_dict()
                 torch.save(model_dict, ckpt_path)
 
         self.models = [self.base_model, self.model, self.model_ema]
         if self.hparams['prototypes']["use"]:
             self.models.append(self.projector)
         if self.hparams["domain_loss"]["method"] == "mine":
+            self.models.append(self.domain_projector)
             self.models.append(self.mine_net)
         self.model_states, self.optimizer_state = self.copy_model_and_optimizer()
 
@@ -263,16 +244,34 @@ class RMT(TTAMethod):
         logger.info('Set self.clip_model.parameters.reguires_grad = False!')
         for param in self.clip_model.parameters():
             param.requires_grad = False
-        
+
+        if self.hparams["clip_model"]["task_specific"]:
+            cfg = EasyDict({
+                'CORRUPTION': {
+                    'DATASET': self.dataset_name
+                },
+                'CKPT_DIR': self.ckpt_dir,
+                'CKPT_PATH': self.ckpt_path,
+                'MODEL': {
+                    'ARCH': self.arch_name,
+                    'WEIGHTS': self.model_weights
+                }
+            })
+            self.vit_task_specific = get_model(cfg, self.num_classes)
+            self.vit_task_specific.eval()
+            for param in self.vit_task_specific.parameters():
+                param.requires_grad = False
+            self.vit_feature_extractor, _ = split_up_model(self.vit_task_specific, self.arch_name, self.dataset_name)
+            self.vit_feature_extractor = self.vit_feature_extractor.to(device=self.device, dtype=self.clip_model.dtype)
 
         ##### Class Prompt用  refer DPLCLIP
         prompt_prefix = ' '.join(['X'] * self.hparams['num_domain_tokens'])
         
         if self.hparams['sentence_prompt']:
             logger.info('Using sentence_prompt in DPLCLIP...')
-            classnames = [f"a photo of a {name.replace('_', ' ')}" for name in self.hparams['class_names']]
+            classnames = [f"a photo of a {name.replace('_', ' ')}" for name in self.class_names]
         else:
-            classnames = [name.replace('_', ' ') for name in self.hparams['class_names']]
+            classnames = [name.replace('_', ' ') for name in self.class_names]
 
         ##### to get default token_prefix and token_suffix.
         class_prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]  # (クラス数)
@@ -305,16 +304,139 @@ class RMT(TTAMethod):
                 torch.nn.init.xavier_uniform(m.weight)
                 m.bias.data.fill_(0.01)
         # Student model
-        # self.model = networks.MLP(self.EMBEDDING_DIM, self.EMBEDDING_DIM * self.hparams['num_domain_tokens'], self.hparams).to(device=self.device, dtype=self.clip_model.dtype)
-        self.model = networks.MLP(self.EMBEDDING_DIM * self.hparams['num_domain_tokens'], self.EMBEDDING_DIM * self.hparams['num_domain_tokens'], self.hparams).to(device=self.device, dtype=self.clip_model.dtype)
+        self.model = networks.MLP(
+            self.EMBEDDING_DIM,
+            self.EMBEDDING_DIM * self.hparams['num_domain_tokens'],
+            self.hparams
+            ).to(device=self.device, dtype=self.clip_model.dtype)
         self.model.apply(init_weights)
         # Setup EMA model (Teacherモデル)  重みの更新はしない
         self.model_ema = self.copy_model(self.model)
         for param in self.model_ema.parameters():
             param.detach_()
+
+
+    def _get_features(self, x, y=None, source=False, warmup=False):
+        """ 
+            source も warmup も False の場合は, Forwardプロセスを指す.
+            変数名の fts は features の fts.
+        """
+        assert not (source and warmup), "source and warmup cannot be True at the same time"
+
+        if self.hparams["clip_model"]["task_specific"]:
+            image_encoder = self.vit_feature_extractor
+        else:
+            image_encoder = self.clip_model.encode_image
+
+        x_cls = self.normal_transform(x)  # (B, 3, 224, 224)
+        with torch.no_grad():
+            image_fts = image_encoder(x_cls)  # (B, EMBEDDING_DIM)
+
+        ##### Return Source
+        if source:
+            return image_fts / image_fts.norm(dim=-1, keepdim=True)
+
+        ##### Domain Features, Loss
+        if self.hparams["domain_loss"]["method"]:
+            self.domain_optimizer.zero_grad()
+            x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
+            # Features
+            with torch.no_grad():
+                image_clsdst_fts = image_encoder(x_clsdst)  # (B, EMBEDDING_DIM)
+            base_clsdst_fts = self.base_model(image_clsdst_fts)  # (B, EMBEDDING_DIM)
+
+            domain_fts = self.domain_projector(base_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
+
+            image_clsdst_fts = image_clsdst_fts / image_clsdst_fts.norm(dim=-1, keepdim=True)
+            domain_text_fts = domain_text_fts / domain_text_fts.norm(dim=-1, keepdim=True)
         
-        self.optimizer.add_param_group({'params': self.model.parameters(), 'lr': self.optimizer.param_groups[0]["lr"]})
-        self.optimizer.add_param_group({'params': self.model_ema.parameters(), 'lr': self.optimizer.param_groups[0]["lr"]})
+            # Loss
+            domain_loss = self._get_domain_loss(image_clsdst_fts, domain_text_fts)
+            # domain_loss.backward(retain_graph=True)
+            # self.domain_optimizer.step()
+            self.scaler.scale(domain_loss).backward()
+            self.scaler.step(self.domain_optimizer)
+            self.scaler.update()
+
+            del x_clsdst, image_clsdst_fts, base_clsdst_fts, domain_text_fts, domain_loss
+            gc.collect()
+        
+        ##### Class Features, Loss, Concat Text Features.
+        def _get_class_logits(model, base_fts, image_fts):
+            # Class Features
+            class_fts = model(base_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            mean_class_fts = class_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
+            _mean_class_fts = mean_class_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
+            # Text Features
+            text_fts = self._cat_class_domain_text_features(_mean_class_fts, class_domain="class")  # (num_classes, EMBEDDING_DIM)
+            text_fts = text_fts / text_fts.norm(dim=-1, keepdim=True)
+            # Concat Class, Text Features
+            logits = self.clip_model.logit_scale.exp() * image_fts @ text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
+            
+            return logits
+
+        self.optimizer.zero_grad()
+        base_fts = self.base_model(image_fts)  # (B, EMBEDDING_DIM)
+        image_fts = image_fts / image_fts.norm(dim=-1, keepdim=True)
+        logits_st = _get_class_logits(self.model, base_fts, image_fts)  # (B, num_classes)
+        logits_ema = _get_class_logits(self.model_ema, base_fts, image_fts)  # (B, num_classes)
+
+        if warmup:
+            ##### Warm Up
+            loss = symmetric_cross_entropy(logits_st, logits_ema).mean(0)
+            # loss.backward()
+            # self.optimizer.step()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.model_ema = update_ema_variables(ema_model=self.model_ema, model=self.model, alpha_teacher=self.m_teacher_momentum)
+            return
+        else:
+            ##### Forward Process
+            x_aug = self.tta_transform(x_cls)
+            with torch.no_grad():
+                image_aug_fts = image_encoder(x_aug)  # (B, EMBEDDING_DIM)
+            logits_aug = _get_class_logits(self.model, base_fts, image_aug_fts)  # (B, num_classes)
+            # Loss
+            # 式(6)
+            loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
+            # 式(9)のうち, targetドメインに対するLoss (第1項)
+            loss_trg = self.lambda_ce_trg * loss_entropy
+
+            ##### contrastive_loss
+            if self.hparams['prototypes']["use"]:
+                ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
+                with torch.no_grad():
+                    # dist[:, i] contains the distance from every source sample to one test sample
+                    # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
+                    # self.prototypes_src  (num_classes, EMBEDDING_DIM * num_domain_tokens)
+                    dist = F.cosine_similarity(
+                        x1=self.prototypes_src.repeat(1, image_fts.shape[0], 1),
+                        x2=image_fts.view(1, image_fts.shape[0], image_fts.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
+                        dim=-1)  # (num_classes, B)
+                    # for every test feature, get the nearest source prototype and derive the label
+                    # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
+                    _, indices = dist.topk(1, largest=True, dim=0)  # (1, B)
+                    indices = indices.squeeze(0)  # (B,)
+
+                features = torch.cat([self.prototypes_src[indices],
+                                    image_fts.view(image_fts.shape[0], 1, image_fts.shape[1]),
+                                    image_aug_fts.view(image_fts.shape[0], 1, image_fts.shape[1])], dim=1)  # (B, 3, EMBEDDING_DIM)
+                # 式(7)
+                loss_contrastive = self.contrastive_loss(features=features, labels=None)
+                # 式(9)のうち, targetドメインに対するLoss (第2項)
+                loss_trg += self.lambda_cont * loss_contrastive
+            
+            # loss_trg.backward()
+            # self.optimizer.step()
+            self.scaler.scale(loss_trg).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.model_ema = update_ema_variables(ema_model=self.model_ema, model=self.model, alpha_teacher=self.m_teacher_momentum)
+            
+            # create and return the ensemble prediction
+            return logits_st + logits_ema
 
 
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
@@ -325,7 +447,6 @@ class RMT(TTAMethod):
             #linearly increase the learning rate
             for par in self.optimizer.param_groups:
                 par["lr"] = self.final_lr * (i+1) / self.warmup_steps
-
             # sample source batch
             try:
                 batch = next(self.src_loader_iter)
@@ -335,23 +456,8 @@ class RMT(TTAMethod):
 
             imgs_src = self.normal_transform(batch[0]).to(self.device)
             labels_src = batch[1].long().to(self.device)
-            imgs_src_clsdst = self.clsdst_transform(batch[0]).to(self.device)
 
-            self.optimizer.zero_grad()
-            
-            ##### Domain Loss
-            if self.hparams["domain_loss"]["method"]:
-                domain_loss = self._calc_clip_domain_loss(imgs_src_clsdst, labels_src)
-                domain_loss.backward()
-                self.optimizer.step()
-            
-            ##### Class Loss
-            _, logits_per_image, logits_per_image_ema = self._calc_clip_class_logits(imgs_src, labels_src)
-            loss_sce = symmetric_cross_entropy(logits_per_image, logits_per_image_ema).mean(0)
-            loss_sce.backward()
-            self.optimizer.step()
-
-            self.model_ema = update_ema_variables(ema_model=self.model_ema, model=self.model, alpha_teacher=self.m_teacher_momentum)
+            self._get_features(imgs_src, warmup=True)
 
         logger.info(f"Finished warm up...")
         for par in self.optimizer.param_groups:
@@ -360,129 +466,35 @@ class RMT(TTAMethod):
 
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
     def forward_and_adapt(self, x):
-        imgs_test = self.normal_transform(x[0]).to(self.device)
-        imgs_test_aug = self.tta_transform((imgs_test)).to(self.device)
+        ensembled_logits = self._get_features(x[0])
+        return ensembled_logits
 
-        self.optimizer.zero_grad()
-
-        ##### Domain Training
-        if self.hparams["domain_loss"]["method"]:
-            imgs_test_clsdst = self.clsdst_transform(x[0]).to(self.device).to(self.device)
-            domain_loss = self._calc_clip_domain_loss(imgs_test_clsdst)
-            domain_loss.backward()
-            self.optimizer.step()
-            
-        ##### Self Training
-        features_test, logits_per_image, logits_per_image_ema = self._calc_clip_class_logits(imgs_test)
-        features_test_aug, logits_per_image_aug, _ = self._calc_clip_class_logits(imgs_test_aug)
-        # 式(6)
-        loss_entropy = self_training_loss(x=logits_per_image, x_aug=logits_per_image_aug, x_ema=logits_per_image_ema).mean(0)
-        # 式(9)のうち, targetドメインに対するLoss (第1項)
-        loss_trg = self.lambda_ce_trg * loss_entropy
-        
-        ##### contrastive_loss
-        if self.hparams['prototypes']["use"]:
-            ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
-            with torch.no_grad():
-                # dist[:, i] contains the distance from every source sample to one test sample
-                # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
-                dist = F.cosine_similarity(
-                    x1=self.prototypes_src.repeat(1, features_test.shape[0], 1),
-                    x2=features_test.view(1, features_test.shape[0], features_test.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
-                    dim=-1)  # (クラス数, B)
-
-                # for every test feature, get the nearest source prototype and derive the label
-                # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
-                _, indices = dist.topk(1, largest=True, dim=0)  # (1, B)
-                indices = indices.squeeze(0)  # (B,)
-
-            features = torch.cat([self.prototypes_src[indices],
-                                features_test.view(features_test.shape[0], 1, features_test.shape[1]),
-                                features_test_aug.view(features_test.shape[0], 1, features_test.shape[1])], dim=1)  # (B, 3, EMBEDDING_DIM)
-            # 式(7)
-            loss_contrastive = self.contrastive_loss(features=features, labels=None)
-            # 式(9)のうち, targetドメインに対するLoss (第2項)
-            loss_trg += self.lambda_cont * loss_contrastive
-
-        loss_trg.backward()
-        self.optimizer.step()
-
-        self.model_ema = update_ema_variables(ema_model=self.model_ema, model=self.model, alpha_teacher=self.m_teacher_momentum)
-
-        # create and return the ensemble prediction
-        return logits_per_image + logits_per_image_ema
+    # @torch.no_grad()
+    # def forward_sliding_window(self, x):
+    #     """
+    #     Create the prediction for single sample test-time adaptation with a sliding window
+    #     :param x: The buffered data created with a sliding window
+    #     :return: Model predictions
+    #     """
+    #     imgs_test = x[0]
+    #     outputs_test = self.model(imgs_test)
+    #     outputs_ema = self.model_ema(imgs_test)
+    #     return outputs_test + outputs_ema
 
 
-    @torch.no_grad()
-    def forward_sliding_window(self, x):
+    def _get_domain_loss(self, image_clsdst_features, domain_text_features):
         """
-        Create the prediction for single sample test-time adaptation with a sliding window
-        :param x: The buffered data created with a sliding window
-        :return: Model predictions
+            image_clsdst_features: (B, EMBEDDING_DIM)
+            domain_text_features: (B, EMBEDDING_DIM)
         """
-        imgs_test = x[0]
-        outputs_test = self.model(imgs_test)
-        outputs_ema = self.model_ema(imgs_test)
-        return outputs_test + outputs_ema
-
-
-
-    def _calc_clip_class_logits(self, imgs, labels=None):
-        """
-            imgs: (B, 3, 224, 224)
-        """
-        image_features = self.clip_model.encode_image(imgs)  # (B, EMBEDDING_DIM)
-        # Student / Teacher Model
-        # domain_features = self.model(image_features)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        base_features = self.base_model(image_features)  # (B, EMBEDDING_DIM)
-        domain_features = self.model(base_features)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        mean_domain_features = domain_features.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
-        # 各クラス特徴と結合するために，クラス数文複製する.
-        _mean_domain_features = mean_domain_features.repeat_interleave(len(self.hparams['class_names']), dim=0)  # (Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
-
-        # domain_features_ema = self.model_ema(image_features)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        domain_features_ema = self.model_ema(base_features)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        mean_domain_features_ema = domain_features_ema.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
-        _mean_domain_features_ema = mean_domain_features_ema.repeat_interleave(len(self.hparams['class_names']), dim=0)  # (Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
-        
-        # Text Features
-        # prefix + domain_features + suffix(=CLS, EOS) である Text Featuresを作成する.
-        text_features = self._get_class_text_features(_mean_domain_features)  # (Sourceクラス数, EMBEDDING_DIM)
-        text_features_ema = self._get_class_text_features(_mean_domain_features_ema)  # (Sourceクラス数, EMBEDDING_DIM)
-
-        # Normalize Features
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        text_features_ema = text_features_ema / text_features_ema.norm(dim=-1, keepdim=True)
-        
-        # calc logits  t()は転置, 
-        # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
-        logits_per_image = self.clip_model.logit_scale.exp() * image_features @ text_features.t()  # (B, Sourceクラス数)
-        logits_per_image_ema = self.clip_model.logit_scale.exp() * image_features @ text_features_ema.t()  # (B, Sourceクラス数)
-        
-        return image_features, logits_per_image, logits_per_image_ema
-
-
-    def _calc_clip_domain_loss(self, imgs_clsdst, label=None):
-        """
-            imgs_clsdst: (B, 3, 224, 224)
-        """
-        image_clsdst_features = self.clip_model.encode_image(imgs_clsdst)  # (B, EMBEDDING_DIM)
-        # domain_features = self.model(image_clsdst_features)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        domain_features = self.base_model(image_clsdst_features)  # (B, EMBEDDING_DIM)
-        domain_text_features = self._get_domain_text_features(domain_features, batch_size=imgs_clsdst.shape[0])  # (B, EMBEDDING_DIM
-
-        image_clsdst_features = image_clsdst_features / image_clsdst_features.norm(dim=-1, keepdim=True)
-        domain_text_features = domain_text_features / domain_text_features.norm(dim=-1, keepdim=True)
-        
         if self.hparams["domain_loss"]["method"] == "nt_xent":
-            loss = self.domain_criterion(image_clsdst_features, domain_text_features)
+            domain_loss = self.domain_criterion(image_clsdst_features, domain_text_features)
         elif self.hparams["domain_loss"]["method"] == "mine":
             # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う．
             # そのため，バッチサイズは大きめでなくてはならない.
             sim_mtx = F.cosine_similarity(
-                    x1=image_clsdst_features.unsqueeze(0),  # (B, B, EMBEDDING_DIM)
-                    x2=domain_text_features.unsqueeze(1),  # (B, B, EMBEDDING_DIM)
+                    x1=image_clsdst_features.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
+                    x2=domain_text_features.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
                     dim=-1).detach().cpu().numpy()  # (B, B)
 
             bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
@@ -491,57 +503,53 @@ class RMT(TTAMethod):
             diag = torch.diag(clustered_mtx).long()
             mean_feat_per_clust = [domain_text_features[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
 
+            domain_loss = 0.
             for i in range(len(mean_feat_per_clust)):
                 for j in range(i+1, len(mean_feat_per_clust)):
                     data = torch.stack([mean_feat_per_clust[i], mean_feat_per_clust[j]], dim=1)
-                    loss, _ = self.mine_trainer.get_loss(data)
-        return loss
+                    mine_loss, _ = self.mine_trainer.get_loss(data)
+                    ##### TODO: 足していくのが適切か？ 平均とるのが適切か?
+                    domain_loss += mine_loss
+
+        return domain_loss
     
             
-    def _get_class_text_features(self, domain_feature):
-        """ domain feature + text feature 
-            domain_feature: (Sourceクラス数, EMBEDDING_DIM * num_domain_tokens)
-
-            self.token_prefix.shape:  SOS (Sourceクラス数, 1, EMBEDDING_DIM)
-            self.token_suffix.shape:  EOS (Sourceクラス数, 77 - 1 - self.hparams['num_domain_tokens'], EMBEDDING_DIM)
+    def _cat_class_domain_text_features(self, class_domain_fts, class_domain):
+        """ class_domain_fts + text feature 
+            L: classの場合は クラス数, domainの場合は batch size
+            self.token_prefix.shape:  SOS (L, 1, EMBEDDING_DIM)
+            self.token_suffix.shape:  EOS (L, 77 - 1 - self.hparams['num_domain_tokens'], EMBEDDING_DIM)
+        args:
+            class_domain_fts: (L, EMBEDDING_DIM * num_domain_tokens)
+            class_domain: "class" or "domain"
+        return:
+            class_domain_fts + text feature 
         """
-        domain_feature = domain_feature.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (Sourceクラス数, num_domain_tokens, EMBEDDING_DIM)
-        prompt_domain_feat = torch.cat([self.token_prefix, domain_feature, self.token_suffix], dim=1)  # (Sourceクラス数, 77, EMBEDDING_DIM)
+        assert class_domain in ["class", "domain"], f"Invalid class_domain: {class_domain}. class_domain must be 'class' or 'domain'"
+        class_domain_fts = class_domain_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
+        
+        if class_domain == "class":
+            param_fts = torch.cat([self.token_prefix, class_domain_fts, self.token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
+            tokenized_prompts = self.tokenized_prompts
+        else:
+            batch_size = class_domain_fts.shape[0]
+            rep_token_prefix = self.domain_token_prefix.repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
+            rep_token_suffix = self.domain_token_suffix.repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
+            param_fts = torch.cat([rep_token_prefix, class_domain_fts, rep_token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
+            tokenized_prompts = self.domain_tokenized_prompts  # (L, 77)
         
         # refer CoOp: CoOP github. https://github.com/KaiyangZhou/CoOp/blob/b0a058869cef00a4e4ea5256d40fd7681119c099/trainers/coop.py#L46
         # domain_featureに位置エンコーディングを加え，位置情報をembedding空間に反映する．
-        x = prompt_domain_feat + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (Sourceクラス数, 77, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (77, Sourceクラス数, EMBEDDING_DIM)
-        x = self.clip_model.transformer(x)  # (77, Sourceクラス数, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (Sourceクラス数, 77, EMBEDDING_DIM)
-        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)  # (Sourceクラス数, 77, EMBEDDING_DIM)
+        x = param_fts + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
+        x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
+        x = self.clip_model.transformer(x)  # (77, L, EMBEDDING_DIM)
+        x = x.permute(1, 0, 2)  # (L, 77, EMBEDDING_DIM)
+        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
         
-        # mapping domain_features to text_features.
-        # xがドメイン特徴(にtransformerを適用したもの)，self.tokenized_promptsがテキスト特徴．
-        text_features = x[torch.arange(x.shape[0]), self.tokenized_prompts.argmax(dim=-1)] @ self.clip_model.text_projection  # (Sourceクラス数, EMBEDDING_DIM))
-        return text_features
+        # mapping domain_features to class_domain_text_fts.
+        class_domain_text_fts = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.clip_model.text_projection  # (L, EMBEDDING_DIM))
 
-
-    def _get_domain_text_features(self, domain_features, batch_size):
-        """
-            domain_features: (B, EMBEDDING_DIM * num_domain_tokens)
-        return
-            domain_text_features: (B, EMBEDDING_DIM)
-        """
-        domain_features = domain_features.reshape(domain_features.shape[0], self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        rep_token_prefix = self.domain_token_prefix.repeat_interleave(batch_size, dim=0)  # (B, 1, EMBEDDING_DIM)
-        rep_token_suffix = self.domain_token_suffix.repeat_interleave(batch_size, dim=0)  # (B, 77-1-num_domain_tokens, EMBEDDING_DIM)
-        domain_token_cat = torch.cat([rep_token_prefix, domain_features, rep_token_suffix], dim=1)  # (B, 77, EMBEDDING_DIM)
-
-        x = domain_token_cat + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (B, 77, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (77, B, EMBEDDING_DIM)
-        x = self.clip_model.transformer(x)  # (77, B, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (B, 77, EMBEDDING_DIM)
-        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)  # (B, 77, EMBEDDING_DIM)
-        
-        domain_text_features = x[torch.arange(x.shape[0]), self.domain_tokenized_prompts.argmax(dim=-1)] @ self.clip_model.text_projection  # (B, EMBEDDING_DIM))
-
-        return domain_text_features
+        return class_domain_text_fts
         
 
     def _get_bistochastic_mtx(self, sim_mtx):
@@ -620,6 +628,36 @@ class RMT(TTAMethod):
         loss = loss.view(anchor_count, batch_size).mean()
         return loss
 
+
+    def _set_optimizer(self):
+        assert self.hparams["domain_loss"]["method"] == "mine", "Only support mine method for domain loss"
+        if self.hparams["domain_loss"]["method"]:
+            class_args_list = [
+                {'params': self.model.parameters()},
+                {'params': self.model_ema.parameters()},
+            ]
+            domain_args_list = [
+                {'params': self.base_model.parameters()},
+                {'params': self.domain_projector.parameters()},
+                {'params': self.mine_net.parameters()},
+            ]
+            if self.hparams["optimizer"] == "Adam":
+                return torch.optim.Adam(class_args_list, lr=self.hparams['lr']) \
+                        , torch.optim.Adam(domain_args_list, lr=self.hparams['lr'])
+            elif self.hparams["optimizer"] == "SGD":
+                return torch.optim.SGD(class_args_list, lr=self.hparams['lr'], momentum=self.hparams['momentum']) \
+                        , torch.optim.SGD(domain_args_list, lr=self.hparams['lr'], momentum=self.hparams['momentum'])
+        else:
+            class_args_list = [
+                {'params': self.base_model.parameters()},
+                {'params': self.model.parameters()},
+                {'params': self.model_ema.parameters()},
+            ]
+            if self.hparams["optimizer"] == "Adam":
+                return torch.optim.Adam(class_args_list, lr=self.hparams['lr'])
+            elif self.hparams["optimizer"] == "SGD":
+                return torch.optim.SGD(class_args_list, lr=self.hparams['lr'], momentum=self.hparams['momentum'])
+            
 
 @torch.jit.script
 def self_training_loss(x, x_aug, x_ema):# -> torch.Tensor:

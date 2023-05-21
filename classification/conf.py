@@ -15,6 +15,7 @@ import numpy as np
 from datetime import datetime
 from iopath.common.file_io import g_pathmgr
 from yacs.config import CfgNode as CfgNode
+from easydict import EasyDict
 
 
 # Global config object (example usage: from core.config import cfg)
@@ -167,8 +168,8 @@ _C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
 # _C.RMT.NUM_SAMPLES_WARM_UP = 50000
-_C.RMT.NUM_SAMPLES_WARM_UP = 500000
-# _C.RMT.NUM_SAMPLES_WARM_UP = 5000
+# _C.RMT.NUM_SAMPLES_WARM_UP = 500000
+_C.RMT.NUM_SAMPLES_WARM_UP = 5000
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()
@@ -383,3 +384,45 @@ def get_domain_sequence(ckpt_path):
                "sketch": ["painting", "clipart", "real"],
                }
     return mapping[domain]
+
+
+
+def set_hparams():
+    hparams = EasyDict({
+        "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
+        "num_domain_tokens": 16,
+        "sentence_prompt": True, ####### 独自に追加.
+        "optimizer": "SGD", ####### 独自に追加.
+        "mixed_precision": True, ####### 独自に追加.
+        'mlp_depth': 3,
+        'mlp_width': 512,
+        'mlp_dropout': 0.1,
+        'lr': 1e-3,
+        'momentum': 0.1,
+        'weight_decay': 0.,
+        ########################################################################################################################
+        "clip_model": {
+            "task_specific": False,
+        },
+        ########################################################################################################################
+        "base_model": {
+            "architecture": "mlp",  # choice(['mlp', 'my_transformer']),
+        },
+        "warmup": {
+            "use": True,
+            "load_model": False,
+        },
+        "prototypes": {
+            "use": False,
+            "load": False,
+        },
+        "domain_loss": {
+            "method": "mine",  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
+            # "method": False,  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
+            "nt_xent_temperature": 0.5,
+        },
+        "cuda_visible_devices": os.environ.get('CUDA_VISIBLE_DEVICES'),
+        "exec_num": os.environ.get('exec_num'),
+    })
+
+    return hparams
