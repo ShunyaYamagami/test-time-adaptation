@@ -167,9 +167,9 @@ _C.RMT = CfgNode()
 _C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
-# _C.RMT.NUM_SAMPLES_WARM_UP = 50000
+_C.RMT.NUM_SAMPLES_WARM_UP = 50000
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500000
-_C.RMT.NUM_SAMPLES_WARM_UP = 5000
+# _C.RMT.NUM_SAMPLES_WARM_UP = 5000
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()
@@ -400,11 +400,9 @@ def set_hparams():
         'lr': 1e-3,
         'momentum': 0.1,
         'weight_decay': 0.,
-        ########################################################################################################################
         "clip_model": {
-            "task_specific": True,
+            "task_specific": False,
         },
-        ########################################################################################################################
         "base_model": {
             "architecture": "mlp",  # choice(['mlp', 'my_transformer']),
         },
@@ -421,8 +419,8 @@ def set_hparams():
             # "method": False,  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
             "nt_xent_temperature": 0.5,
         },
-        "cuda_visible_devices": os.environ.get('CUDA_VISIBLE_DEVICES'),
-        "exec_num": os.environ.get('exec_num'),
+        "cuda_visible_devices": int(os.environ.get('CUDA_VISIBLE_DEVICES')),
+        "exec_num": int(os.environ.get('exec_num')),
     })
 
     return hparams

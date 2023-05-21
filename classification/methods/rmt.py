@@ -37,28 +37,26 @@ class RMT(TTAMethod):
         super().__init__(steps, episodic, window_length)
         logger.info(f"----- RMT __init__ -----")
 
+        ####################################################################################
+        ####################################################################################
+        if int(hparams["cuda_visible_devices"]) == 0:
+            hparams["prototypes"]["use"] = False
+            hparams["domain_loss"]["method"] = False
+        elif int(hparams["cuda_visible_devices"]) == 1:
+            hparams["prototypes"]["use"] = False
+            hparams["domain_loss"]["method"] = "mine"
+        elif int(hparams["cuda_visible_devices"]) == 2:
+            hparams["prototypes"]["use"] = True
+            hparams["domain_loss"]["method"] = False
+        elif int(hparams["cuda_visible_devices"]) == 3:
+            hparams["prototypes"]["use"] = True
+            hparams["domain_loss"]["method"] = "mine"
+        ###########
+        if int(hparams["exec_num"]) == 2:
+            hparams["base_model"]["architecture"] = "my_transformer"
+        ####################################################################################
+        ####################################################################################
         self.hparams = hparams
-        ####################################################################################
-        ####################################################################################
-        self.hparams["clip_model"]["task_specific"] = True
-        # if self.hparams["cuda_visible_devices"] == 0:
-        #     self.hparams["prototypes"]["use"] = False
-        #     self.hparams["domain_loss"]["method"] = False
-        # elif self.hparams["cuda_visible_devices"] == 1:
-        #     self.hparams["prototypes"]["use"] = False
-        #     self.hparams["domain_loss"]["method"] = "mine"
-        # elif self.hparams["cuda_visible_devices"] == 2:
-        #     self.hparams["prototypes"]["use"] = True
-        #     self.hparams["domain_loss"]["method"] = False
-        # elif self.hparams["cuda_visible_devices"] == 3:
-        #     self.hparams["prototypes"]["use"] = True
-        #     self.hparams["domain_loss"]["method"] = "mine"
-        # ###########
-        # if self.hparams["exec_num"] == 2:
-        #     self.hparams["base_model"]["architecture"] = "my_transformer"
-        ####################################################################################
-        ####################################################################################
-
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
         assert self.hparams['base_model']['architecture'] in ['mlp', 'my_transformer'], f'base_model must be "mlp" or "my_transformer", but got {self.hparams["base_model"]}'
         assert self.hparams['domain_loss']['method'] in [False, 'nt_xent', 'mine'], f"loss method must be False, 'nt_xent' or 'mine', but got {self.hparams['domain_loss']['method']}"
