@@ -145,7 +145,7 @@ def setup_rmt(hparams):
                                       ckpt_path=cfg.CKPT_PATH,
                                       percentage=cfg.SOURCE.PERCENTAGE,
                                       workers=min(cfg.SOURCE.NUM_WORKERS, os.cpu_count()),
-                                      clip_task_specific=hparams.clip_model.task_specific)
+                                      clip_task_specific=hparams['clip_model']['task_specific'])
     rmt_model = RMT(
                     hparams=hparams,
                     steps=cfg.OPTIM.STEPS,

@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 import torchvision
 import torchvision.transforms as transforms
+from torchsummary import summary
 from transformers import BertModel
 import clip
 from sinkhorn_knopp import sinkhorn_knopp as skp
@@ -90,17 +91,14 @@ class RMT(TTAMethod):
         self.save_dir = save_dir
         self.model_weights = model_weights
         self.warmup_steps = num_samples_warm_up // self.src_loader.batch_size
-        self.tta_transform = get_tta_transforms(self.dataset_name)
+        self.tta_transform = get_tta_transforms(self.dataset_name, clip_task_specific=self.hparams['clip_model']['task_specific'])
         self.normal_transform, self.clsdst_transform = get_transform_when_iteration(grid=4)
         # 自動的にレイヤ毎に最適なビット精度を選択してくれる（convはfp16, bnはfp32等）. ベストプラクティスを選択してくれるため、便利。use_amp=Falseではfp32を使用する。
         self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])
 
         ########## Set Models ##########
         self.set_clip_models()
-        if self.hparams['clip_model']['task_specific']:
-            input_dim = 640
-        else:
-            input_dim = self.EMBEDDING_DIM
+        input_dim = self.EMBEDDING_DIM
         if self.hparams['base_model']['architecture'] == "mlp":
             self.base_model = networks.MLP(
                 input_dim,
@@ -262,7 +260,12 @@ class RMT(TTAMethod):
             for param in self.vit_task_specific.parameters():
                 param.requires_grad = False
             self.vit_feature_extractor, _ = split_up_model(self.vit_task_specific, self.arch_name, self.dataset_name)
-            self.vit_feature_extractor = self.vit_feature_extractor.to(device=self.device, dtype=self.clip_model.dtype)
+            self.vit_feature_extractor.new_layer = nn.Sequential(
+                nn.Linear(640, self.EMBEDDING_DIM, bias=False),
+                nn.BatchNorm1d(self.EMBEDDING_DIM),
+                nn.ReLU()
+            )
+            self.vit_feature_extractor = nn.DataParallel(self.vit_feature_extractor).to(device=self.device, dtype=self.clip_model.dtype)
 
         ##### Class Prompt用  refer DPLCLIP
         prompt_prefix = ' '.join(['X'] * self.hparams['num_domain_tokens'])

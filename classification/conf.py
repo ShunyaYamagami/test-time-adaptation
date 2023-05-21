@@ -402,14 +402,14 @@ def set_hparams():
         'weight_decay': 0.,
         ########################################################################################################################
         "clip_model": {
-            "task_specific": False,
+            "task_specific": True,
         },
         ########################################################################################################################
         "base_model": {
             "architecture": "mlp",  # choice(['mlp', 'my_transformer']),
         },
         "warmup": {
-            "use": True,
+            "use": False,
             "load_model": False,
         },
         "prototypes": {
