@@ -400,14 +400,22 @@ def set_hparams():
         'lr': 1e-3,
         'momentum': 0.1,
         'weight_decay': 0.,
+        #########################################################################
+        ### clip_model
+            # task_specific は出力次元が640次元となり, 512次元に合わない. (Resizeすればいけるかも?)
+            # これを解消するために nn.Linear(640, 512)を挟んだが, やはり学習が出鱈目になる.
+            # また, LiTはpre-trained modelを基に Text Encoderを対象学習させたので, Image Encoderを別のモデル置換させて良いということではない.
+            # これをTrueにすることはもうないだろう.
+        "architecture": {
+            'base_model': False,  # choice([False, 'mlp', 'my_transformer']),
+            # 'domain_embedding_pos': 'first',  # choice(['first', 'cat']),
+            'domain_embedding_pos': 'cat',  # choice([False, 'first', 'cat']),
+        }, # 下でupdate
         "clip_model": {
-            "task_specific": False,
-        },
-        "base_model": {
-            "architecture": "mlp",  # choice(['mlp', 'my_transformer']),
+            "task_specific": False,  # これをTrueにすることはもうないだろう.
         },
         "warmup": {
-            "use": False,
+            "use": True,
             "load_model": False,
         },
         "prototypes": {
@@ -415,12 +423,12 @@ def set_hparams():
             "load": False,
         },
         "domain_loss": {
-            "method": "mine",  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
-            # "method": False,  # choice([False, 'nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
+            "method": "mine",  # choice(['nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
             "nt_xent_temperature": 0.5,
         },
-        "cuda_visible_devices": int(os.environ.get('CUDA_VISIBLE_DEVICES')),
+        "cuda_visible_devices": list(map(int, os.environ.get('CUDA_VISIBLE_DEVICES').split(","))),
         "exec_num": int(os.environ.get('exec_num')),
+        "rename_save_dir": False,
     })
 
     return hparams

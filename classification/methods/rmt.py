@@ -17,6 +17,7 @@ import clip
 from sinkhorn_knopp import sinkhorn_knopp as skp
 from sklearn.cluster import SpectralBiclustering
 import gc
+from pathlib import Path
 
 from conf import get_num_classes
 from domainbed import networks
@@ -36,33 +37,35 @@ class RMT(TTAMethod):
                  contrast_mode, temperature, projection_dim, lambda_ce_src, lambda_ce_trg, lambda_cont, m_teacher_momentum, num_samples_warm_up, save_dir, model_weights):
         super().__init__(steps, episodic, window_length)
         logger.info(f"----- RMT __init__ -----")
-
         ####################################################################################
         ####################################################################################
-        if int(hparams["cuda_visible_devices"]) == 0:
-            hparams["prototypes"]["use"] = False
-            hparams["domain_loss"]["method"] = False
-        elif int(hparams["cuda_visible_devices"]) == 1:
-            hparams["prototypes"]["use"] = False
-            hparams["domain_loss"]["method"] = "mine"
-        elif int(hparams["cuda_visible_devices"]) == 2:
-            hparams["prototypes"]["use"] = True
-            hparams["domain_loss"]["method"] = False
-        elif int(hparams["cuda_visible_devices"]) == 3:
-            hparams["prototypes"]["use"] = True
-            hparams["domain_loss"]["method"] = "mine"
-        ###########
-        if int(hparams["exec_num"]) == 2:
-            hparams["base_model"]["architecture"] = "my_transformer"
+        # if hparams["cuda_visible_devices"] == [0]:
+        #     hparams["architecture"] = 'USE_BASE_MODEL'
+        # elif hparams["cuda_visible_devices"] == [2]:
+        #     hparams["architecture"] = 'DOMAIN_FIRST'
         ####################################################################################
         ####################################################################################
         self.hparams = hparams
+        assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
+        assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
-        assert self.hparams['base_model']['architecture'] in ['mlp', 'my_transformer'], f'base_model must be "mlp" or "my_transformer", but got {self.hparams["base_model"]}'
-        assert self.hparams['domain_loss']['method'] in [False, 'nt_xent', 'mine'], f"loss method must be False, 'nt_xent' or 'mine', but got {self.hparams['domain_loss']['method']}"
+        assert not self.hparams['clip_model']['task_specific'], 'task_spevific must be False. 今の所, task_specificにしても精度が上がるわけがない.'
+        assert self.hparams['architecture']['base_model'] in [False, 'mlp', 'my_transformer']
+        assert self.hparams['architecture']['domain_embedding_pos'] in ['first', 'cat']
+        assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
+        assert self.hparams['architecture']['domain_embedding_pos'] in ['first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
         assert self.hparams['warmup']['use'] and num_samples_warm_up > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
+
+        ########## Set save_dir ##########
+        if self.hparams['rename_save_dir']:
+            old_save_dir = save_dir
+            dirname = f"{'_'.join(Path(old_save_dir).name.split('_')[:3])}--ts_{hparams['clip_model']['task_specific']}--base_{hparams['architecture']['base_model']}--warm_{hparams['warmup']['use']}--proto_{hparams['prototypes']['use']}--domain_{hparams['domain_loss']['method']}"
+            dirname = dirname.replace('False', 'F').replace('True', 'T').replace('my_transformer', 'tf')
+            save_dir = str(Path(old_save_dir).parent / dirname)
+            os.rename(old_save_dir, save_dir)
+            logger.info(f"----- Rename save_dir: {save_dir} -----")
 
         with open(os.path.join(save_dir, "hparams.yaml"), 'w') as file:
             yaml.dump(self.hparams, file, default_flow_style=False, sort_keys=False)
@@ -97,23 +100,22 @@ class RMT(TTAMethod):
         ########## Set Models ##########
         self.set_clip_models()
         input_dim = self.EMBEDDING_DIM
-        if self.hparams['base_model']['architecture'] == "mlp":
+        if self.hparams['architecture']['base_model'] == "mlp":
             self.base_model = networks.MLP(
                 input_dim,
                 self.EMBEDDING_DIM,
                 self.hparams
             ).to(device=self.device, dtype=self.clip_model.dtype)
-        elif self.hparams['base_model']['architecture'] == "my_transformer":
+        elif self.hparams['architecture']['base_model'] == "my_transformer":
             self.base_model = MyTransformer(
                 width=input_dim,
                 out_width = self.EMBEDDING_DIM,
                 layers=12,
                 heads=8,
                 context_length=src_loader.batch_size,
-                # context_length=self.clip_model.context_length,
                 attn_mask="build_attention_mask"
             ).to(device=self.device, dtype=self.clip_model.dtype)
-            
+        
         self._set_student_teacher_models() 
 
         ########## Domain Loss ##########
@@ -122,7 +124,7 @@ class RMT(TTAMethod):
             self.skp = skp.SinkhornKnopp()
             n_clusters=(4, 3)
             self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
-            assert self.hparams["domain_loss"]["method"] == "mine", "Only support mine for domain loss when _set_optimizer()"
+            assert self.hparams["domain_loss"]["method"] in [False, "mine"], "Now only support False or MINE for domain loss when _set_optimizer()"
             if self.hparams["domain_loss"]["method"] == "mine":
                 self.mine_net = Mine().cuda()
                 self.mine_trainer = MineTrainer(self.mine_net)
@@ -156,10 +158,10 @@ class RMT(TTAMethod):
                 with torch.no_grad():
                     for data in tqdm.tqdm(self.src_loader):
                         x, y = data[0], data[1]
-                        student_features = self._get_features(x.to(self.device), source=True)
+                        image_fts = self._get_features(x.to(self.device), source=True)
                         #####  TODO: このPrototypesは, プロンプト特徴量ベースでなく, 画像特徴量ベースで作成した方が良いのでは？
                         #####  TODO: WarmUpの後にPrototypesを作成した方が良いのでは?
-                        features_src = torch.cat([features_src, student_features.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
+                        features_src = torch.cat([features_src, image_fts.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
                         labels_src = torch.cat([labels_src, y], dim=0)
                         if len(features_src) > 100000:
                             break
@@ -199,7 +201,8 @@ class RMT(TTAMethod):
             if self.hparams['warmup']['load_model'] and os.path.exists(ckpt_path):
                 logger.info(f"Loading warmup checkpoint... from {ckpt_path}")
                 checkpoint = torch.load(ckpt_path)
-                self.base_model.load_state_dict(checkpoint["base_model"])
+                if self.hparams['architecture']['base_model']:
+                    self.base_model.load_state_dict(checkpoint["base_model"])
                 self.model.load_state_dict(checkpoint["model"])
                 self.model_ema.load_state_dict(checkpoint["model_ema"])
                 if self.hparams["domain_loss"]["method"] == "mine":
@@ -211,17 +214,21 @@ class RMT(TTAMethod):
                 os.makedirs(warmup_ckpt_path, exist_ok=True)
                 self.warmup()
                 model_dict = {
-                    "base_model": self.base_model.state_dict(),
                     "model": self.model.state_dict(),
                     "model_ema": self.model_ema.state_dict(),
                     "optimizer": self.optimizer.state_dict()
                 }
+                if self.hparams["architecture"]['base_model']:
+                    model_dict["base_model"] = self.base_model.state_dict()
                 if self.hparams["domain_loss"]["method"] == "mine":
+                    model_dict["domain_projector"] = self.domain_projector.state_dict()
                     model_dict["mine_net"] = self.mine_net.state_dict()
                     model_dict["domain_optimizer"] = self.domain_optimizer.state_dict()
                 torch.save(model_dict, ckpt_path)
 
-        self.models = [self.base_model, self.model, self.model_ema]
+        self.models = [self.model, self.model_ema]
+        if self.hparams["architecture"]['base_model']:
+            self.models.insert(0, self.base_model)
         if self.hparams['prototypes']["use"]:
             self.models.append(self.projector)
         if self.hparams["domain_loss"]["method"] == "mine":
@@ -262,8 +269,8 @@ class RMT(TTAMethod):
                 nn.Linear(640, self.EMBEDDING_DIM, bias=False),
                 nn.BatchNorm1d(self.EMBEDDING_DIM),
                 nn.ReLU()
-            )
-            self.vit_feature_extractor = nn.DataParallel(self.vit_feature_extractor).to(device=self.device, dtype=self.clip_model.dtype)
+            ).to(device=self.device, dtype=self.clip_model.dtype)
+            self.vit_feature_extractor = nn.DataParallel(self.vit_feature_extractor)
 
         ##### Class Prompt用  refer DPLCLIP
         prompt_prefix = ' '.join(['X'] * self.hparams['num_domain_tokens'])
@@ -277,8 +284,7 @@ class RMT(TTAMethod):
         ##### to get default token_prefix and token_suffix.
         class_prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]  # (クラス数)
         self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in class_prompts]).to(self.device)  # (クラス数, 77)
-        with torch.no_grad():
-            embedding = self.clip_model.token_embedding(self.tokenized_prompts).type(self.clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
+        embedding = self.clip_model.token_embedding(self.tokenized_prompts).type(self.clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
         self.register_buffer('token_prefix', embedding[:, :1, :])  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
         self.register_buffer('token_suffix', embedding[:, self.hparams['num_domain_tokens'] + 1:, :])  # CLS, EOS (クラス数, 68, self.EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
 
@@ -305,8 +311,10 @@ class RMT(TTAMethod):
                 torch.nn.init.xavier_uniform(m.weight)
                 m.bias.data.fill_(0.01)
         # Student model
+        input_dim = self.EMBEDDING_DIM * self.hparams['num_domain_tokens'] \
+            if self.hparams['architecture']['domain_embedding_pos'] == 'first' else self.EMBEDDING_DIM
         self.model = networks.MLP(
-            self.EMBEDDING_DIM,
+            input_dim,
             self.EMBEDDING_DIM * self.hparams['num_domain_tokens'],
             self.hparams
             ).to(device=self.device, dtype=self.clip_model.dtype)
@@ -323,6 +331,7 @@ class RMT(TTAMethod):
             変数名の fts は features の fts.
         """
         assert not (source and warmup), "source and warmup cannot be True at the same time"
+        
 
         if self.hparams["clip_model"]["task_specific"]:
             image_encoder = self.vit_feature_extractor
@@ -330,8 +339,7 @@ class RMT(TTAMethod):
             image_encoder = self.clip_model.encode_image
 
         x_cls = self.normal_transform(x)  # (B, 3, 224, 224)
-        with torch.no_grad():
-            image_fts = image_encoder(x_cls)  # (B, EMBEDDING_DIM)
+        image_fts = image_encoder(x_cls)  # (B, EMBEDDING_DIM)
 
         ##### Return Source
         if source:
@@ -339,49 +347,15 @@ class RMT(TTAMethod):
 
         ##### Domain Features, Loss
         if self.hparams["domain_loss"]["method"]:
-            self.domain_optimizer.zero_grad()
-            x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
-            # Features
-            with torch.no_grad():
-                image_clsdst_fts = image_encoder(x_clsdst)  # (B, EMBEDDING_DIM)
-            base_clsdst_fts = self.base_model(image_clsdst_fts)  # (B, EMBEDDING_DIM)
-
-            domain_fts = self.domain_projector(base_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-            domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
-
-            image_clsdst_fts = image_clsdst_fts / image_clsdst_fts.norm(dim=-1, keepdim=True)
-            domain_text_fts = domain_text_fts / domain_text_fts.norm(dim=-1, keepdim=True)
-        
-            # Loss
-            domain_loss = self._get_domain_loss(image_clsdst_fts, domain_text_fts)
-            # domain_loss.backward(retain_graph=True)
-            # self.domain_optimizer.step()
-            self.scaler.scale(domain_loss).backward()
-            self.scaler.step(self.domain_optimizer)
-            self.scaler.update()
-
-            del x_clsdst, image_clsdst_fts, base_clsdst_fts, domain_text_fts, domain_loss
-            gc.collect()
+            self._get_features__backward_domain_loss(x, image_encoder)
         
         ##### Class Features, Loss, Concat Text Features.
-        def _get_class_logits(model, base_fts, image_fts):
-            # Class Features
-            class_fts = model(base_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-            mean_class_fts = class_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
-            _mean_class_fts = mean_class_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
-            # Text Features
-            text_fts = self._cat_class_domain_text_features(_mean_class_fts, class_domain="class")  # (num_classes, EMBEDDING_DIM)
-            text_fts = text_fts / text_fts.norm(dim=-1, keepdim=True)
-            # Concat Class, Text Features
-            logits = self.clip_model.logit_scale.exp() * image_fts @ text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
-            
-            return logits
-
         self.optimizer.zero_grad()
-        base_fts = self.base_model(image_fts)  # (B, EMBEDDING_DIM)
+        middle_fts = self._get_features__get_middle_features(image_fts)
         image_fts = image_fts / image_fts.norm(dim=-1, keepdim=True)
-        logits_st = _get_class_logits(self.model, base_fts, image_fts)  # (B, num_classes)
-        logits_ema = _get_class_logits(self.model_ema, base_fts, image_fts)  # (B, num_classes)
+        middle_fts = middle_fts / middle_fts.norm(dim=-1, keepdim=True)
+        logits_st = self._get_features__get_sttc_logits(self.model, image_fts, middle_fts)  # (B, num_classes)
+        logits_ema = self._get_features__get_sttc_logits(self.model_ema, image_fts, middle_fts)  # (B, num_classes)
 
         if warmup:
             ##### Warm Up
@@ -396,9 +370,12 @@ class RMT(TTAMethod):
         else:
             ##### Forward Process
             x_aug = self.tta_transform(x_cls)
-            with torch.no_grad():
-                image_aug_fts = image_encoder(x_aug)  # (B, EMBEDDING_DIM)
-            logits_aug = _get_class_logits(self.model, base_fts, image_aug_fts)  # (B, num_classes)
+            image_aug_fts = image_encoder(x_aug)  # (B, EMBEDDING_DIM)
+            middle_aug_fts = self._get_features__get_middle_features(image_aug_fts)
+            image_aug_fts = image_aug_fts / image_aug_fts.norm(dim=-1, keepdim=True)
+            middle_aug_fts = middle_aug_fts / middle_aug_fts.norm(dim=-1, keepdim=True)
+            logits_aug = self._get_features__get_sttc_logits(self.model, image_aug_fts, middle_aug_fts)  # (B, num_classes)
+                
             # Loss
             # 式(6)
             loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
@@ -482,6 +459,69 @@ class RMT(TTAMethod):
     #     outputs_ema = self.model_ema(imgs_test)
     #     return outputs_test + outputs_ema
 
+    def _get_features__get_sttc_logits(self, model, image_fts, middle_fts):
+        """
+            'sttc' stand for Student or Teacher.
+            middle_fts: CLIPのimage_encoderからの特徴量, またはbase_modelを通した後の特徴量
+                (B, EMBEDDING_DIM) or (B, EMBEDDING_DIM * num_domain_tokens)
+        """
+        # Student/Text Features
+        sttc_fts = model(middle_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        mean_sttc_fts = sttc_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
+        repeated_sttc_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
+        if self.hparams['architecture']['domain_embedding_pos'] == 'cat':
+            norm_sttc_fts = repeated_sttc_fts / repeated_sttc_fts.norm(dim=-1, keepdim=True)  # 正規化. (num_classes, EMBEDDING_DIM * num_domain_tokens)
+            with torch.no_grad():
+                domain_fts = self.domain_projector(middle_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+                mean_domain_fts = domain_fts.mean(dim=0, keepdim=True)
+                repeated_domain_fts = mean_domain_fts.repeat_interleave(self.num_classes, dim=0)
+                norm_domain_fts = repeated_domain_fts / repeated_domain_fts.norm(dim=-1, keepdim=True)
+            leanable_parameters = norm_sttc_fts + norm_domain_fts
+        else:
+            leanable_parameters = repeated_sttc_fts
+
+        # Text Features
+        text_fts = self._cat_class_domain_text_features(leanable_parameters, class_domain="class")  # (num_classes, EMBEDDING_DIM)
+        text_fts = text_fts / text_fts.norm(dim=-1, keepdim=True)
+        # Concat Student/Teacher Features and Text Features
+        logits = self.clip_model.logit_scale.exp() * image_fts @ text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
+        
+        return logits
+
+
+    def _get_features__backward_domain_loss(self, x, image_encoder):
+        self.domain_optimizer.zero_grad()
+        x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
+        # Features
+        image_clsdst_fts = image_encoder(x_clsdst)  # (B, EMBEDDING_DIM)
+
+        if self.hparams["architecture"]['base_model']:
+            base_clsdst_fts = self.base_model(image_clsdst_fts)  # (B, EMBEDDING_DIM)
+            domain_fts = self.domain_projector(base_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        else:
+            domain_fts = self.domain_projector(image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+
+        domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
+
+        image_clsdst_fts = image_clsdst_fts / image_clsdst_fts.norm(dim=-1, keepdim=True)
+        domain_text_fts = domain_text_fts / domain_text_fts.norm(dim=-1, keepdim=True)
+    
+        # Loss
+        domain_loss = self._get_domain_loss(image_clsdst_fts, domain_text_fts)
+        self.scaler.scale(domain_loss).backward()
+        self.scaler.step(self.domain_optimizer)
+        self.scaler.update()
+
+
+    def _get_features__get_middle_features(self, image_fts):
+        if self.hparams["architecture"]['base_model']:
+            middle_fts = self.base_model(image_fts)  # (B, EMBEDDING_DIM)
+        elif self.hparams["architecture"]['domain_embedding_pos'] == 'first':
+            middle_fts = self.domain_projector(image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        else:
+            middle_fts = image_fts  # (B, EMBEDDING_DIM)
+        return middle_fts
+    
 
     def _get_domain_loss(self, image_clsdst_features, domain_text_features):
         """
@@ -631,17 +671,17 @@ class RMT(TTAMethod):
 
 
     def _set_optimizer(self):
-        assert self.hparams["domain_loss"]["method"] == "mine", "Only support mine method for domain loss"
         if self.hparams["domain_loss"]["method"]:
             class_args_list = [
                 {'params': self.model.parameters()},
                 {'params': self.model_ema.parameters()},
             ]
             domain_args_list = [
-                {'params': self.base_model.parameters()},
                 {'params': self.domain_projector.parameters()},
                 {'params': self.mine_net.parameters()},
             ]
+            if self.hparams["architecture"]['base_model']:
+                domain_args_list.insert(0, {'params': self.base_model.parameters()})
             if self.hparams["optimizer"] == "Adam":
                 return torch.optim.Adam(class_args_list, lr=self.hparams['lr']) \
                         , torch.optim.Adam(domain_args_list, lr=self.hparams['lr'])
@@ -650,10 +690,11 @@ class RMT(TTAMethod):
                         , torch.optim.SGD(domain_args_list, lr=self.hparams['lr'], momentum=self.hparams['momentum'])
         else:
             class_args_list = [
-                {'params': self.base_model.parameters()},
                 {'params': self.model.parameters()},
                 {'params': self.model_ema.parameters()},
             ]
+            if self.hparams["architecture"]['base_model']:
+                class_args_list.insert(0, {'params': self.base_model.parameters()})
             if self.hparams["optimizer"] == "Adam":
                 return torch.optim.Adam(class_args_list, lr=self.hparams['lr'])
             elif self.hparams["optimizer"] == "SGD":

@@ -32,7 +32,7 @@ else
 fi
 
 
-
+# CUDA_VISIBLE_DEVICES=0  exec_num=1  python  test_time.py  --cfg  cfgs/cifar10_c/rmt.yaml
 # . cmd.sh  0  1  0
 # . cmd.sh  1  1  1
 # . cmd.sh  2  1  2
