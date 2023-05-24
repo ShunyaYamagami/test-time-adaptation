@@ -15,7 +15,7 @@ from torchsummary import summary
 import clip
 from pathlib import Path
 
-from methods.base import TTAMethod
+from methods.rmt import set_models, set_optimizers
 from datasets.data_loading import get_source_loader
 from loss.nt_xent import NTXentLoss
 
@@ -33,8 +33,8 @@ class Pretrain():
         self.projection_dim = self.cfg.CONTRAST.PROJECTION_DIM
         self.pretrained_dir = os.path.join(cfg.CKPT_DIR, self.dataset_name, 'pretrained')
 
-        # self.model = 
-        # self.domain_projector = 
+        self.models = set_models()
+        self.domain_projectors = set_optimizers()
         self.pre_class_criterion = nn.CrossEntropyLoss()
         self.pre_domain_criterion = NTXentLoss(self.device, self.batch_size_src, self.hparams["domain_loss"]["nt_xent_temperature"])
 
@@ -58,10 +58,11 @@ class Pretrain():
         for epoch in tqdm.tqdm(range(self.hparams['pretrain']['epochs'])):
             for batch_idx, (x, y) in enumerate(self.train_loader):
                 # train
-                self.model.train()
-                self.domain_projector.train()
-                self._learning(x.cuda(), y.cuda(), pretrain=True)
-                # valid
+                for m in self.models:
+                    m.train()
+                # self._learning(x.cuda(), y.cuda(), pretrain=True)
+
+            # valid
             for batch_idx, (x, y) in enumerate(self.test_loader):
                 with torch.no_grad():
                     self.model.eval()

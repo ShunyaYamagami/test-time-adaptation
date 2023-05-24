@@ -27,7 +27,6 @@ from models.model import get_model, split_up_model
 from models.my_transformer import MyTransformer
 from models.mine import Mine, MineTrainer
 from loss.nt_xent import NTXentLoss
-from methods.pretrain import Pretrain
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +75,8 @@ class RMT(TTAMethod):
         self.EMBEDDING_DIM = 512
         self.dataset_name = dataset_name
         self.arch_name = arch_name
-        self.class_names = src_loader.dataset.classes
-        self.num_classes = len(self.class_names)
+        class_names = src_loader.dataset.classes
+        self.num_classes = len(class_names)
         self.src_loader = src_loader
         self.src_loader_iter = iter(self.src_loader)
         self.ckpt_dir = ckpt_dir
@@ -100,7 +99,7 @@ class RMT(TTAMethod):
         self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])
                 
         ########## Set CLIP Models ##########
-        self.set_clip_models()
+        self.clip_model, self.tokens = set_clip_models(self.hparams, self.device, class_names)
                 
         ########## Prototypes ##########
         if self.hparams['prototypes']['use']:
@@ -189,43 +188,6 @@ class RMT(TTAMethod):
                 for optim_name in self.optimizers.keys():
                     state_dicts[optim_name] = self.optimizers[optim_name].state_dict()
                 torch.save(state_dicts, ckpt_path)
-
-
-    def set_clip_models(self):
-        # embedding dim for image and text encoder.
-        logger.info(f"----- Set Clip Models,  clip_backbone : {self.hparams['clip_backbone']}  -----")
-        self.clip_model, preprocess = clip.load(self.hparams['clip_backbone'], device=self.device)
-        self.clip_model = self.clip_model.float()
-
-        # CLIPモデルのパラメータは更新させない
-        logger.info('Set self.clip_model.parameters.reguires_grad = False!')
-        for param in self.clip_model.parameters():
-            param.requires_grad = False
-
-        ##### Class Prompt用  refer DPLCLIP
-        prompt_prefix = ' '.join(['X'] * self.hparams['num_domain_tokens'])
-        
-        if self.hparams['sentence_prompt']:
-            logger.info('Using sentence_prompt in DPLCLIP...')
-            classnames = [f"a photo of a {name.replace('_', ' ')}" for name in self.class_names]
-        else:
-            classnames = [name.replace('_', ' ') for name in self.class_names]
-
-        ##### to get default token_prefix and token_suffix.
-        class_prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]  # (クラス数)
-        self.tokenized_prompts = torch.cat([clip.tokenize(p) for p in class_prompts]).to(self.device)  # (クラス数, 77)
-        embedding = self.clip_model.token_embedding(self.tokenized_prompts).type(self.clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
-        self.register_buffer('token_prefix', embedding[:, :1, :])  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
-        self.register_buffer('token_suffix', embedding[:, self.hparams['num_domain_tokens'] + 1:, :])  # CLS, EOS (クラス数, 68, self.EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
-
-        ##### Domain Prompt用  refer DPLCLIP
-        if self.hparams["domain_loss"]["method"]:
-            domain_prompts = prompt_prefix + 'a photo of a '
-            self.domain_tokenized_prompts = clip.tokenize(domain_prompts).to(self.device)  # (1, 77)
-            domain_embedding = self.clip_model.token_embedding(self.domain_tokenized_prompts).type(self.clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
-            # self.register_buffer('domain_token_prefix', domain_embedding[:, :1, :])  # SOS (1, 1, self.EMBEDDING_DIM)
-            self.register_buffer('domain_token_prefix', domain_embedding[:, :1:, :])  # CLS, EOS (1, 68, self.EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
-            self.register_buffer('domain_token_suffix', domain_embedding[:, self.hparams['num_domain_tokens'] + 1:, :])  # CLS, EOS (1, 68, self.EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
 
 
     def _learning(self, x, y=None, pretrain=False, source=False, warmup=False):
@@ -458,8 +420,8 @@ class RMT(TTAMethod):
     def _cat_class_domain_text_features(self, class_domain_fts, class_domain):
         """ class_domain_fts + text feature 
             L: classの場合は クラス数, domainの場合は batch size
-            self.token_prefix.shape:  SOS (L, 1, EMBEDDING_DIM)
-            self.token_suffix.shape:  EOS (L, 77 - 1 - self.hparams['num_domain_tokens'], EMBEDDING_DIM)
+            self.tokens['token_prefix'].shape:  SOS (L, 1, EMBEDDING_DIM)
+            self.tokens['token_suffix'].shape:  EOS (L, 77 - 1 - self.hparams['num_domain_tokens'], EMBEDDING_DIM)
         args:
             class_domain_fts: (L, EMBEDDING_DIM * num_domain_tokens)
             class_domain: "class" or "domain"
@@ -470,14 +432,14 @@ class RMT(TTAMethod):
         class_domain_fts = class_domain_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
         
         if class_domain == "class":
-            param_fts = torch.cat([self.token_prefix, class_domain_fts, self.token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
-            tokenized_prompts = self.tokenized_prompts
+            param_fts = torch.cat([self.tokens['token_prefix'], class_domain_fts, self.tokens['token_suffix']], dim=1)  # (L, 77, EMBEDDING_DIM)
+            tokenized_prompts = self.tokens['tokenized_prompts']
         else:
             batch_size = class_domain_fts.shape[0]
-            rep_token_prefix = self.domain_token_prefix.repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
-            rep_token_suffix = self.domain_token_suffix.repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
+            rep_token_prefix = self.tokens['domain_token_prefix'].repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
+            rep_token_suffix = self.tokens['domain_token_suffix'].repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
             param_fts = torch.cat([rep_token_prefix, class_domain_fts, rep_token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
-            tokenized_prompts = self.domain_tokenized_prompts  # (L, 77)
+            tokenized_prompts = self.tokens['domain_tokenized_prompts']  # (L, 77)
         
         # refer CoOp: CoOP github. https://github.com/KaiyangZhou/CoOp/blob/b0a058869cef00a4e4ea5256d40fd7681119c099/trainers/coop.py#L46
         # domain_featureに位置エンコーディングを加え，位置情報をembedding空間に反映する．
@@ -590,6 +552,46 @@ def update_ema_variables(ema_model, model, alpha_teacher):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
     return ema_model
+
+
+def set_clip_models(hparams, device, class_names):
+    # embedding dim for image and text encoder.
+    logger.info(f"----- Set Clip Models,  clip_backbone : {hparams['clip_backbone']}  -----")
+    clip_model, preprocess = clip.load(hparams['clip_backbone'], device=device)
+    clip_model = clip_model.float()
+
+    # CLIPモデルのパラメータは更新させない
+    logger.info('Set self.clip_model.parameters.reguires_grad = False!')
+    for param in clip_model.parameters():
+        param.requires_grad = False
+
+    ##### Class Prompt用  refer DPLCLIP
+    prompt_prefix = ' '.join(['X'] * hparams['num_domain_tokens'])
+    
+    if hparams['sentence_prompt']:
+        logger.info('Using sentence_prompt in DPLCLIP...')
+        classnames = [f"a photo of a {name.replace('_', ' ')}" for name in class_names]
+    else:
+        classnames = [name.replace('_', ' ') for name in class_names]
+
+    ##### to get default token_prefix and token_suffix.
+    tokens = {}
+    class_prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]  # (クラス数)
+    tokens['tokenized_prompts'] = torch.cat([clip.tokenize(p) for p in class_prompts]).to(device)  # (クラス数, 77)
+    embedding = clip_model.token_embedding(tokens['tokenized_prompts']).type(clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
+    tokens['token_prefix'] = embedding[:, :1, :]  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
+    tokens['token_suffix'] = embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (クラス数, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+    
+    ##### Domain Prompt用  refer DPLCLIP
+    if hparams["domain_loss"]["method"]:
+        domain_prompts = prompt_prefix + 'a photo of a '
+        tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
+        domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
+        # self.register_buffer('domain_token_prefix', domain_embedding[:, :1, :])  # SOS (1, 1, EMBEDDING_DIM)
+        tokens['token_suffix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
+        tokens['token_prefix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+        
+    return clip_model, tokens
 
 
 def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
