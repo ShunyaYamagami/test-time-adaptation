@@ -40,11 +40,10 @@ class Pretrain():
 
     def dataloader(self):
         args = {
-            'dataset_name': self.cfg.CORRUPTION.DATASET,
+            'dataset_name': self.dataset_name,
             'root_dir': self.cfg.DATA_DIR,
             'adaptation': self.cfg.MODEL.ADAPTATION,
             'batch_size': self.batch_size_src,
-            'train_split': True,
             'ckpt_path': self.cfg.CKPT_PATH,
             'percentage': self.cfg.SOURCE.PERCENTAGE,
             'workers': min(self.cfg.SOURCE.NUM_WORKERS, os.cpu_count()),

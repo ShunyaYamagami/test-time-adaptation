@@ -421,11 +421,11 @@ def set_hparams():
             'load': True,
         },
         "warmup": {
-            "use": True,
+            "use": False,
             "load_model": False,
         },
         "prototypes": {
-            "use": True,
+            "use": False,
             "load": False,
         },
         "domain_loss": {

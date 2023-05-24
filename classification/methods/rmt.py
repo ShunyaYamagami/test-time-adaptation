@@ -378,6 +378,7 @@ class RMT(TTAMethod):
 
         image_clsdst_fts = F.normalize(image_clsdst_fts)
         domain_text_fts = F.normalize(domain_text_fts)
+        
         # Loss
         domain_loss = self._get_domain_loss(image_clsdst_fts, domain_text_fts)
         self.scaler.scale(domain_loss).backward()
@@ -588,8 +589,8 @@ def set_clip_models(hparams, device, class_names):
         tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
         domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
         # self.register_buffer('domain_token_prefix', domain_embedding[:, :1, :])  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['token_suffix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['token_prefix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+        tokens['domain_token_prefix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
+        tokens['domain_token_suffix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
         
     return clip_model, tokens
 
