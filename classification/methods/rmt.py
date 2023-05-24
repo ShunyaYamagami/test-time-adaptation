@@ -99,6 +99,9 @@ class RMT(TTAMethod):
         # 自動的にレイヤ毎に最適なビット精度を選択してくれる（convはfp16, bnはfp32等）. ベストプラクティスを選択してくれるため、便利。use_amp=Falseではfp32を使用する。
         self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])
                 
+        ########## Set CLIP Models ##########
+        self.set_clip_models()
+                
         ########## Prototypes ##########
         if self.hparams['prototypes']['use']:
             proto_dir_path = os.path.join(ckpt_dir, "prototypes")
@@ -133,18 +136,17 @@ class RMT(TTAMethod):
                     self.prototypes_src = torch.cat([self.prototypes_src, features_src[mask].mean(dim=0, keepdim=True)], dim=0)
 
                 torch.save(self.prototypes_src, fname)
-
                 self.prototypes_src = self.prototypes_src.to(self.device).unsqueeze(1) 
-                self.prototype_labels_src = torch.arange(start=0, end=self.num_classes, step=1).to(self.device).long()  # (クラス数)
+                # self.prototype_labels_src = torch.arange(start=0, end=self.num_classes, step=1).to(self.device).long()  # (クラス数)
 
 
         ########## Set Models ##########
-        self.set_clip_models()
         num_channels = self.prototypes_src.shape[-1] if self.hparams['prototypes']['use'] else None
         self.models = set_models(hparams, self.device, self.EMBEDDING_DIM, self.clip_model.dtype, dataset_name,
                                     self.src_batch_size, projection_dim, num_channels)
         self.optimizers = set_optimizers(hparams, self.models)
         self.final_lr = self.optimizers['optimizer'].param_groups[0]["lr"]
+
 
         ########## Domain Loss ##########
         if self.hparams["domain_loss"]["method"]:
@@ -157,8 +159,6 @@ class RMT(TTAMethod):
                 self.mine_trainer.mine_optim = self.optimizers['domain_optimizer']
             elif self.hparams["domain_loss"]["method"] == "nt_xent":
                 self.ntxent_criterion = NTXentLoss(self.device, self.src_loader.batch_size, self.hparams["domain_loss"]["nt_xent_temperature"])
-
-                
                 
 
         ########## Warm Up ##########
@@ -422,6 +422,7 @@ class RMT(TTAMethod):
         self.scaler.step(self.optimizers['domain_optimizer'])
         self.scaler.update()
     
+
     def _get_domain_loss(self, image_clsdst_features, domain_text_features):
         """
             image_clsdst_features: (B, EMBEDDING_DIM)

@@ -425,7 +425,7 @@ def set_hparams():
             "load_model": False,
         },
         "prototypes": {
-            "use": False,
+            "use": True,
             "load": False,
         },
         "domain_loss": {
