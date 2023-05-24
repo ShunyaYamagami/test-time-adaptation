@@ -25,19 +25,19 @@ class Mine(nn.Module):
 
 
 class MineTrainer():
-    def __init__(self, mine_net):
+    def __init__(self, mine):
         super().__init__()
-        self.mine_net = mine_net
-        # self.mine_net_optim = optimizer
-        # self.mine_net_optim = optim.Adam(self.mine_net.parameters(), lr=1e-3)
+        self.mine = mine
+        # self.mine_optim = optimizer
+        # self.mine_optim = optim.Adam(self.mine.parameters(), lr=1e-3)
         self.ma_rate=0.01
         self.batch_size = 100
         self.ma_et = 1.
 
     # OK MINE.ipynb そのまま
     def mutual_information(self, joint, marginal):
-        t = self.mine_net(joint)
-        et = torch.exp(self.mine_net(marginal))
+        t = self.mine(joint)
+        et = torch.exp(self.mine(marginal))
         mi_lb = torch.mean(t) - torch.log(torch.mean(et))
         return mi_lb, t, et
     
@@ -74,10 +74,10 @@ class MineTrainer():
     def train(self, data, iter_num=int(5e+3), log_freq=int(1e+3)):
         result = []
         for i in range(iter_num):
-            self.mine_net_optim.zero_grad()
+            self.mine_optim.zero_grad()
             loss, mi_lb = self.get_loss(data)
             loss.backward()
-            self.mine_net_optim.step()
+            self.mine_optim.step()
 
             result.append(mi_lb.detach().cpu().numpy())
 

@@ -167,9 +167,9 @@ _C.RMT = CfgNode()
 _C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
-_C.RMT.NUM_SAMPLES_WARM_UP = 50000
+# _C.RMT.NUM_SAMPLES_WARM_UP = 50000
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500000
-# _C.RMT.NUM_SAMPLES_WARM_UP = 5000
+_C.RMT.NUM_SAMPLES_WARM_UP = 500
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()
@@ -409,10 +409,16 @@ def set_hparams():
         "architecture": {
             'base_model': False,  # choice([False, 'mlp', 'my_transformer']),
             # 'domain_embedding_pos': 'first',  # choice(['first', 'cat']),
-            'domain_embedding_pos': 'cat',  # choice([False, 'first', 'cat']),
+            'domain_embedding_pos': 'first',  # choice([False, 'first', 'cat']),
         }, # 下でupdate
-        "clip_model": {
-            "task_specific": False,  # これをTrueにすることはもうないだろう.
+        # "clip_model": {
+        #     "task_specific": False,  # これをTrueにすることはもうないだろう.
+        # },
+        "pretrain": {
+            'epochs': 1000,
+            'encoders': False,
+            'prompt_net': True,
+            'load': True,
         },
         "warmup": {
             "use": True,

@@ -19,7 +19,7 @@ from augmentations.transforms_adacontrast import get_augmentation_versions, get_
 logger = logging.getLogger(__name__)
 
 
-def get_transform(dataset_name, adaptation, clip_task_specific=False):
+def get_transform(dataset_name, adaptation):
     """
     Get transformation pipeline
     Note that the data normalization is done inside of the model
@@ -42,21 +42,15 @@ def get_transform(dataset_name, adaptation, clip_task_specific=False):
     else:
         # create non-method specific transformation
         if dataset_name in {"cifar10", "cifar100"}:
-            if clip_task_specific:
-                transform = transforms.Compose([transforms.ToTensor()])
-            else:
-                transform = transforms.Compose([
-                    transforms.Resize(224),
-                    transforms.ToTensor(),
-                ])
+            transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+            ])
         elif dataset_name in {"cifar10_c", "cifar100_c"}:
-            if clip_task_specific:
-                transform = transforms.Compose([transforms.ToTensor()])
-            else:
-                transform = transforms.Compose([
-                    transforms.Resize(224),
-                    transforms.ToTensor(),
-                ])
+            transform = transforms.Compose([
+                transforms.Resize(224),
+                transforms.ToTensor(),
+            ])
         elif dataset_name == "imagenet_c":
             # note that ImageNet-C is already resized and centre cropped
             transform = transforms.Compose([transforms.ToTensor()])
@@ -71,13 +65,13 @@ def get_transform(dataset_name, adaptation, clip_task_specific=False):
     return transform
 
 
-def get_test_loader(setting, adaptation, dataset_name, root_dir, domain_name, severity, num_examples, domain_names_all, alpha_dirichlet=0, batch_size=128, shuffle=False, workers=4, clip_task_specific=False):
+def get_test_loader(setting, adaptation, dataset_name, root_dir, domain_name, severity, num_examples, domain_names_all, alpha_dirichlet=0, batch_size=128, shuffle=False, workers=4):
     # Fix seed again to ensure that the test sequence is the same for all methods
     random.seed(1)
     np.random.seed(1)
 
     data_dir = complete_data_dir_path(root=root_dir, dataset_name=dataset_name)
-    transform = get_transform(dataset_name, adaptation, clip_task_specific)
+    transform = get_transform(dataset_name, adaptation)
 
     # create the test dataset
     if domain_name == "none":
@@ -152,7 +146,7 @@ def get_test_loader(setting, adaptation, dataset_name, root_dir, domain_name, se
     return torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=workers, drop_last=False)
 
 
-def get_source_loader(dataset_name, root_dir, adaptation, batch_size, train_split=True, ckpt_path=None, num_samples=None, percentage=1.0, workers=4, clip_task_specific=False):
+def get_source_loader(dataset_name, root_dir, adaptation, batch_size, train_split=True, ckpt_path=None, num_samples=None, percentage=1.0, workers=4):
     # create the name of the corresponding source dataset
     dataset_name = dataset_name.split("_")[0] if dataset_name in {"cifar10_c", "cifar100_c", "imagenet_c", "imagenet_k"} else dataset_name
 
@@ -160,7 +154,7 @@ def get_source_loader(dataset_name, root_dir, adaptation, batch_size, train_spli
     data_dir = complete_data_dir_path(root=root_dir, dataset_name=dataset_name)
 
     # setup the transformation pipeline
-    transform = get_transform(dataset_name, adaptation, clip_task_specific)
+    transform = get_transform(dataset_name, adaptation)
 
     # create the source dataset
     if dataset_name == "cifar10":

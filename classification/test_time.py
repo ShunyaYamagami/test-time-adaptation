@@ -101,7 +101,7 @@ def evaluate(description):
                                                batch_size=cfg.TEST.BATCH_SIZE,
                                                shuffle=False,
                                                workers=min(cfg.TEST.NUM_WORKERS, os.cpu_count()),
-                                                clip_task_specific=hparams.clip_model.task_specific)
+                                            )
 
             acc, domain_dict = get_accuracy(
                 model, data_loader=test_data_loader, dataset_name=cfg.CORRUPTION.DATASET,
@@ -145,8 +145,9 @@ def setup_rmt(hparams):
                                       ckpt_path=cfg.CKPT_PATH,
                                       percentage=cfg.SOURCE.PERCENTAGE,
                                       workers=min(cfg.SOURCE.NUM_WORKERS, os.cpu_count()),
-                                      clip_task_specific=hparams['clip_model']['task_specific'])
+                                      )
     rmt_model = RMT(
+                    cfg=cfg, 
                     hparams=hparams,
                     steps=cfg.OPTIM.STEPS,
                     episodic=cfg.MODEL.EPISODIC,
