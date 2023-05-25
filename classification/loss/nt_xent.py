@@ -3,10 +3,9 @@ import torch.nn as nn
 import numpy as np
 
 class NTXentLoss(nn.Module):
-    def __init__(self, device, batch_size, temperature, use_cosine_similarity=True):
+    def __init__(self, device, temperature, use_cosine_similarity=True):
         super().__init__()
         self.device = device
-        self.batch_size = batch_size
         self.temperature = temperature
         self.softmax = nn.Softmax(dim=-1)
         if use_cosine_similarity:
@@ -16,10 +15,10 @@ class NTXentLoss(nn.Module):
         self.criterion = nn.CrossEntropyLoss(reduction="sum")
 
 
-    def _get_pos_neg_masks(self, positive=True):
+    def _get_pos_neg_masks(self, batch_size, positive=True):
         """ 行列の要素(xis, xis), (xis, xjs), (xjs, xjs) が0,それ以外が1の行列をつくり,類似度行列のフィルタを作る."""
-        pos_pairs = torch.from_numpy(np.eye(2 * self.batch_size, 2 * self.batch_size, k=self.batch_size))
-        tril = torch.tril(torch.ones(2 * self.batch_size, 2 * self.batch_size))
+        pos_pairs = torch.from_numpy(np.eye(2 * batch_size, 2 * batch_size, k=batch_size))
+        tril = torch.tril(torch.ones(2 * batch_size, 2 * batch_size))
 
         if positive:
             positive_masks = pos_pairs.type(torch.bool).to(self.device)
@@ -49,15 +48,18 @@ class NTXentLoss(nn.Module):
 
     def forward(self, zis, zjs):
         """ 最初にバッチ内の全ての組合せの類似度行列を作り,正例か負例かでフィルタ掛けてInfoNCEを計算する. """
+        assert zis.shape == zjs.shape
+        batch_size = zis.shape[0]
+
         representations = torch.cat([zjs, zis], dim=0)  # 縦に結合
         similarity_matrix = self.similarity_function(representations, representations)  # 類似度行列の作成
         # 類似度行列からpositive/negativeの要素を取り出す.
-        positives = similarity_matrix[self._get_pos_neg_masks(positive=True)].view(self.batch_size, -1)  # 1次元化したものをviewで
-        negatives = similarity_matrix[self._get_pos_neg_masks(positive=False)].view(self.batch_size, -1)
+        positives = similarity_matrix[self._get_pos_neg_masks(batch_size, positive=True)].view(batch_size, -1)  # 1次元化したものをviewで
+        negatives = similarity_matrix[self._get_pos_neg_masks(batch_size, positive=False)].view(batch_size, -1)
 
         logits = torch.cat((positives, negatives), dim=1)  # 横に結合.
         logits /= self.temperature
-        labels = torch.zeros(self.batch_size).to(self.device).long()  # 1次元
+        labels = torch.zeros(batch_size).to(self.device).long()  # 1次元
         loss = self.criterion(logits, labels)  # logitsは重みでもある.重みが大きい(類似度が大きい)　-> lossは小さくなる
 
-        return loss / self.batch_size
+        return loss / batch_size

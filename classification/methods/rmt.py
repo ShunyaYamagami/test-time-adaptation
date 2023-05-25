@@ -53,7 +53,7 @@ class RMT(TTAMethod):
         assert self.hparams['architecture']['domain_embedding_pos'] in ['first', 'cat']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['architecture']['domain_embedding_pos'] in ['first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
-        assert self.hparams['pretrain']['prompt_net'] and self.hparams['architecture']['domain_embedding_pos'] and self.hparams['domain_loss']['method']  or not self.hparams['pretrain']['prompt_net'], "if prompt_net is True, domain_embedding_pos and domain_loss must be True."
+        # assert self.hparams['pretrain']['prompt_net'] and self.hparams['architecture']['domain_embedding_pos'] and self.hparams['domain_loss']['method']  or not self.hparams['pretrain']['prompt_net'], "if prompt_net is True, domain_embedding_pos and domain_loss must be True."
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
         assert self.hparams['warmup']['use'] and num_samples_warm_up > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
@@ -190,12 +190,12 @@ class RMT(TTAMethod):
                 torch.save(state_dicts, ckpt_path)
 
 
-    def _learning(self, x, y=None, pretrain=False, source=False, warmup=False):
+    def _learning(self, x, y=None, source=False, warmup=False):
         """ 
             source も warmup も False の場合は, Forwardプロセスを指す.
             変数名の fts は features の fts.
         """
-        assert (pretrain, source, warmup).count(True) <= 1
+        assert (source, warmup).count(True) <= 1
         x_cls = self.normal_transform(x)  # (B, 3, 224, 224)
         image_fts = self.clip_model.encode_image(x_cls)  # (B, EMBEDDING_DIM)
 
@@ -226,68 +226,45 @@ class RMT(TTAMethod):
             x_aug = self.tta_transform(x_cls)
             image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
             logits_aug, norm_image_aug_fts, _ = self._learning__get_sttc_logits(self.models['model_st'], image_aug_fts)  # (B, num_classes)
+            # Loss
+            # 式(6)
+            loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
+            # 式(9)のうち, targetドメインに対するLoss (第1項)
+            loss_trg = self.lambda_ce_trg * loss_entropy
 
-            if pretrain:
-                """ Student Modelは, augとともにクラス正解誤差で逆伝播
-                    Domain Projectorは, augとのcontrastive learningで行う. (後々RPLを応用しても良いかもしれない.)
-                """
-                if self.hparams["domain_loss"]["method"]:
-                    self.optimizers['domain_optimizer'].zero_grad()
-                    domain_fts = self._learning__backward_domain_loss(x_cls, pretrain=True)
-                    domain_aug_fts = self._learning__backward_domain_loss(x_aug, pretrain=True)
-                    pre_domain_loss = self.pre_domain_criterion(domain_fts, domain_aug_fts)
-                    self.scaler.scale(pre_domain_loss).backward()
-                    self.scaler.step(self.optimizers['domain_optimizer'])
-                    self.scaler.update()
+            ##### contrastive_loss
+            if self.hparams['prototypes']["use"]:
+                ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
+                with torch.no_grad():
+                    # dist[:, i] contains the distance from every source sample to one test sample
+                    # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
+                    # self.prototypes_src  (num_classes, EMBEDDING_DIM * num_domain_tokens)
+                    dist = F.cosine_similarity(
+                        x1=self.prototypes_src.repeat(1, norm_image_fts.shape[0], 1),
+                        x2=norm_image_fts.view(1, norm_image_fts.shape[0], norm_image_fts.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
+                        dim=-1)  # (num_classes, B)
+                    # for every test feature, get the nearest source prototype and derive the label
+                    # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
+                    _, indices = dist.topk(1, largest=True, dim=0)  # (1, B)
+                    indices = indices.squeeze(0)  # (B,)
 
-                pre_loss_st = self.pre_class_criterion(logits_st.argmax(1), y)
-                pre_loss_aug = self.pre_class_criterion(logits_aug.argmax(1), y)
-                pre_class_loss = pre_loss_st + pre_loss_aug
-                self.scaler.scale(pre_class_loss).backward()
-                self.scaler.step(self.optimizers['domain_optimizer'])
-                self.scaler.update()
-
-                return pre_loss_st
-            else:
-                # Loss
-                # 式(6)
-                loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
-                # 式(9)のうち, targetドメインに対するLoss (第1項)
-                loss_trg = self.lambda_ce_trg * loss_entropy
-
-                ##### contrastive_loss
-                if self.hparams['prototypes']["use"]:
-                    ##### Contrastive Lossのために, prototypes_srcとstudentの特徴ベクトルの類似度を計算する．
-                    with torch.no_grad():
-                        # dist[:, i] contains the distance from every source sample to one test sample
-                        # self.prototypes_srcは、ソースプロトタイプの特徴ベクトルを表すテンソル. './ckpt/prototypes/protos_cifar10_c_Standard.pth'から読み込んだもの.
-                        # self.prototypes_src  (num_classes, EMBEDDING_DIM * num_domain_tokens)
-                        dist = F.cosine_similarity(
-                            x1=self.prototypes_src.repeat(1, norm_image_fts.shape[0], 1),
-                            x2=norm_image_fts.view(1, norm_image_fts.shape[0], norm_image_fts.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
-                            dim=-1)  # (num_classes, B)
-                        # for every test feature, get the nearest source prototype and derive the label
-                        # 指定した次元でテンソル内の最大の要素とそのインデックスを取得する
-                        _, indices = dist.topk(1, largest=True, dim=0)  # (1, B)
-                        indices = indices.squeeze(0)  # (B,)
-
-                    features = torch.cat([self.prototypes_src[indices],
-                                        norm_image_fts.view(norm_image_fts.shape[0], 1, norm_image_fts.shape[1]),
-                                        norm_image_aug_fts.view(norm_image_fts.shape[0], 1, norm_image_fts.shape[1])], dim=1)  # (B, 3, EMBEDDING_DIM)
-                    # 式(7)
-                    loss_contrastive = self.contrastive_loss(features=features, labels=None)
-                    # 式(9)のうち, targetドメインに対するLoss (第2項)
-                    loss_trg += self.lambda_cont * loss_contrastive
-                
-                # loss_trg.backward()
-                # self.optimizer.step()
-                self.scaler.scale(loss_trg).backward()
-                self.scaler.step(self.optimizers['optimizer'])
-                self.scaler.update()
-                self.models['model_ema'] = update_ema_variables(ema_model=self.models['model_ema'], model=self.models['model_st'], alpha_teacher=self.m_teacher_momentum)
-                
-                # create and return the ensemble prediction
-                return logits_st + logits_ema
+                features = torch.cat([self.prototypes_src[indices],
+                                    norm_image_fts.view(norm_image_fts.shape[0], 1, norm_image_fts.shape[1]),
+                                    norm_image_aug_fts.view(norm_image_fts.shape[0], 1, norm_image_fts.shape[1])], dim=1)  # (B, 3, EMBEDDING_DIM)
+                # 式(7)
+                loss_contrastive = self.contrastive_loss(features=features, labels=None)
+                # 式(9)のうち, targetドメインに対するLoss (第2項)
+                loss_trg += self.lambda_cont * loss_contrastive
+            
+            # loss_trg.backward()
+            # self.optimizer.step()
+            self.scaler.scale(loss_trg).backward()
+            self.scaler.step(self.optimizers['optimizer'])
+            self.scaler.update()
+            self.models['model_ema'] = update_ema_variables(ema_model=self.models['model_ema'], model=self.models['model_st'], alpha_teacher=self.m_teacher_momentum)
+            
+            # create and return the ensemble prediction
+            return logits_st + logits_ema
 
 
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
@@ -359,7 +336,7 @@ class RMT(TTAMethod):
         return logits, norm_image_fts, middle_fts
 
 
-    def _learning__backward_domain_loss(self, x, pretrain=False):
+    def _learning__backward_domain_loss(self, x):
         self.optimizers['domain_optimizer'].zero_grad()
         x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
         # Features
@@ -371,9 +348,6 @@ class RMT(TTAMethod):
         else:
             domain_fts = self.models['domain_projector'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
 
-        if pretrain:
-            return F.normalize(domain_fts, dim=1)
-            
         domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
 
         image_clsdst_fts = F.normalize(image_clsdst_fts)
@@ -596,13 +570,16 @@ def set_clip_models(hparams, device, class_names):
 
 
 def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
-                src_batch_size, projection_dim, num_channels=None):
+                src_batch_size, projection_dim=None, num_channels=None):
     """ F() Network for extraction of domain feature.
 
         ここで, self.modelとしているのは F() Network. 元コードのpre-trained modelとは異なることに注意.
         既存コードを書きたくなかったからこうした．
         どちらも同じ "Student model"という意味では共通している.
     """
+    assert (hparams['prototypes']['use'] and projection_dim is not None) or (not hparams['prototypes']['use'])
+    assert (hparams['prototypes']['use'] and num_channels is not None) or (not hparams['prototypes']['use'])
+
     ##### Student Teacher Model
     def init_weights(m):
         if isinstance(m, nn.Linear):
