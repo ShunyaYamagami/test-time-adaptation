@@ -107,32 +107,34 @@ class Pretrain():
         
     def cls_train(self):
         self.best = 0.
-        for epoch in tqdm.tqdm(range(self.hparams['pretrain']['epochs'])):
+        for epoch in tqdm.tqdm(range(self.hparams['pretrain_epochs'])):
             self.models['model_st'].train()
             for batch_idx, (x, y) in tqdm.tqdm(enumerate(self.train_loader)):
                 x, y = x.to(self.device), y.to(self.device)
                 x_cls = self.normal_transform(x)
-                # x_aug = self.tta_transform(x_cls)
                 
                 with torch.no_grad():
                     image_fts = self.clip_model.encode_image(x_cls)
-                    # image_fts_aug = self.clip_model.encode_image(x_aug)
 
                 self.optimizers['optimizer'].zero_grad()
                 logits_st, _, _ = self._learning__get_sttc_logits(self.models['model_st'], image_fts, for_domain=False)  # (B, num_classes)
-                # logits_st_aug, _, _ = self._learning__get_sttc_logits(self.models['model_st'], image_fts_aug, for_domain=False)  # (B, num_classes)
 
                 loss_st = self.pre_class_criterion(logits_st, y)
-                # loss_st_aug = self.pre_class_criterion(logits_st_aug, y)
-                # loss_st_total = loss_st + loss_st_aug
                 loss_st_total = loss_st
 
-                loss_st_total.backward()
-                self.optimizers['optimizer'].step()
-                self.scheduler.step()
-                # self.scaler.scale(loss_st_total).backward()
-                # self.scaler.step(self.optimizers['optimizer'])
-                # self.scaler.update()
+                ##### 下手なaugmentationなので, これで学習すると精度が著しく下がる #######
+                # x_aug = self.tta_transform(x_cls)
+                # with torch.no_grad():
+                    # image_fts_aug = self.clip_model.encode_image(x_aug)
+                # logits_st_aug, _, _ = self._learning__get_sttc_logits(self.models['model_st'], image_fts_aug, for_domain=False)  # (B, num_classes)
+                # loss_st_aug = self.pre_class_criterion(logits_st_aug, y)
+                # loss_st_total = loss_st + loss_st_aug
+                ###################################################################
+
+                self.scaler.scale(loss_st_total).backward()
+                self.scaler.step(self.optimizers['optimizer'])
+                self.scaler.update()
+                # self.scheduler.step()
 
             # valid
             self.models['model_st'].eval()
@@ -160,7 +162,7 @@ class Pretrain():
     def domain_train(self):
         """ Domain Features, Loss,  Contrastive Loss """
         assert self.hparams["domain_loss"]["method"]
-        for epoch in tqdm.tqdm(range(self.hparams['pretrain']['epochs'])):
+        for epoch in tqdm.tqdm(range(self.hparams['pretrain_epochs'])):
             for model_name in self.models.keys():
                 self.models[model_name].train()
             for batch_idx, (x, y) in tqdm.tqdm(enumerate(self.train_loader)):
@@ -177,9 +179,11 @@ class Pretrain():
 
                 loss_domain = self.pre_domain_criterion(norm_domain_fts, norm_domain_aug_fts)
 
-                self.scaler.scale(loss_domain).backward()
-                self.scaler.step(self.optimizers['domain_optimizer'])
-                self.scaler.update()
+                loss_domain.backward()
+                self.optimizers['domain_optimizer'].step()
+                # self.scaler.scale(loss_domain).backward()
+                # self.scaler.step(self.optimizers['domain_optimizer'])
+                # self.scaler.update()
 
                 torch.save(self.models['domain_projector'].state_dict(), os.path.join(self.pretrained_dir, f"domain_projector.pth"))
 
@@ -336,6 +340,7 @@ if __name__ == '__main__':
     ###############################################################################################################
     hparams['optimizer'] = 'Adam'
     hparams['lr'] = 1e-2
+    hparams['pretrain_epochs'] = 1000
     ###############################################################################################################
     ###############################################################################################################
 

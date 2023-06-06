@@ -10,8 +10,8 @@ cd ~/lab/tta/test-time-adaptation/classification
 
 ###### 実行. 
 # 実行コマンド
-# COMMAND="CUDA_VISIBLE_DEVICES=$gpu_i  exec_num=$exec_num  python  test_time.py  --cfg  cfgs/cifar10_c/rmt.yaml"
-COMMAND="CUDA_VISIBLE_DEVICES=$gpu_i  exec_num=$exec_num  python  pretrain.py  --cfg  cfgs/cifar10_c/rmt.yaml"
+COMMAND="CUDA_VISIBLE_DEVICES=$gpu_i  exec_num=$exec_num  python  test_time.py  --cfg  cfgs/cifar10_c/rmt.yaml"
+# COMMAND="CUDA_VISIBLE_DEVICES=$gpu_i  exec_num=$exec_num  python  pretrain.py  --cfg  cfgs/cifar10_c/rmt.yaml"
 if [ -n "$tmux_session" ]; then
     # 第3引数が存在する場合の処理. tmux内で実行する. $tmux_sessionはtmuxのセッション名.
     tmux -2 new -d -s $tmux_session

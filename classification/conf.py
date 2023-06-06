@@ -392,7 +392,8 @@ def set_hparams():
         "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
         "num_domain_tokens": 16,
         "sentence_prompt": True, ####### 独自に追加.
-        "optimizer": "SGD", ####### 独自に追加.
+        # "optimizer": "SGD", ####### 独自に追加.
+        "optimizer": "Adam", ####### 独自に追加.
         "mixed_precision": True, ####### 独自に追加.
         'mlp_depth': 3,
         'mlp_width': 512,
@@ -407,18 +408,13 @@ def set_hparams():
             # また, LiTはpre-trained modelを基に Text Encoderを対象学習させたので, Image Encoderを別のモデル置換させて良いということではない.
             # これをTrueにすることはもうないだろう.
         "architecture": {
+            'prompt_tuning': True,  # promt tuningを行うか否か
             'base_model': False,  # choice([False, 'mlp', 'my_transformer']),
-            # 'domain_embedding_pos': 'first',  # choice(['first', 'cat']),
-            'domain_embedding_pos': 'first',  # choice([False, 'first', 'cat']),
+            'domain_embedding_pos': 'cat',  # choice([False, 'first', 'cat']),
+            # 'domain_embedding_pos': False,  # choice([False, 'first', 'cat']),
         }, # 下でupdate
-        # "clip_model": {
-        #     "task_specific": False,  # これをTrueにすることはもうないだろう.
-        # },
         "pretrain": {
-            'epochs': 1000,
-            'encoders': False,
-            'prompt_net': True,
-            'load': True,
+            'load': False,
         },
         "warmup": {
             "use": False,
@@ -429,7 +425,7 @@ def set_hparams():
             "load": False,
         },
         "domain_loss": {
-            "method": "mine",  # choice(['nt_xent', 'mine']),  ここがFalseなら, domain_lossは使わない事になる.
+            "method": "mine",  # choice(['nt_xent', 'mine']),  Domain学習をするか否かは architecture の部分で制御する.
             "nt_xent_temperature": 0.5,
         },
         "cuda_visible_devices": list(map(int, os.environ.get('CUDA_VISIBLE_DEVICES').split(","))),
