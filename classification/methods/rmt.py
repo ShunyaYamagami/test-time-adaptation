@@ -39,11 +39,11 @@ class RMT(TTAMethod):
         ####################################################################################
         ####################################################################################
         if hparams['cuda_visible_devices'] == [0]:
-            hparams['architecture']['domain_embedding_pos'] = 'sepdim'
+            hparams['architecture']['domain_embedding_pos'] = False
             hparams['architecture']['domain_token_dim'] = 0
             hparams['pretrain']['load'] = False
         elif hparams['cuda_visible_devices'] == [2]:
-            hparams['architecture']['domain_embedding_pos'] = 'sepdim'
+            hparams['architecture']['domain_embedding_pos'] = 'adversarial'
             hparams['architecture']['domain_token_dim'] = 8
             hparams['pretrain']['load'] = False
         ####################################################################################
@@ -54,9 +54,9 @@ class RMT(TTAMethod):
         assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
         assert self.hparams['architecture']['base_model'] in [False, 'mlp', 'my_transformer']
-        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'first', 'cat']
+        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'adversarial', 'first', 'cat']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
-        assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
+        assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'adversarial', 'first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
         assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] == 'cat' or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
         assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load_model'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
@@ -161,7 +161,10 @@ class RMT(TTAMethod):
             assert self.hparams['domain_loss']['method'] in ['mine'], "Now only support MINE for domain loss when _set_optimizer()"
             if self.hparams['domain_loss']['method'] == 'mine':
                 self.mine_trainer = MineTrainer(self.models['mine'])
-                self.mine_trainer.mine_optim = self.optimizers['domain_optimizer']
+                if self.hparams['architecture']['domain_embedding_pos'] == 'adversarial':
+                    self.mine_trainer.mine_optim = self.optimizers['optimizer']
+                else:
+                    self.mine_trainer.mine_optim = self.optimizers['domain_optimizer']
             elif self.hparams['domain_loss']['method'] == 'nt_xent':
                 self.ntxent_criterion = NTXentLoss(self.device, self.src_loader.batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
                 
@@ -203,6 +206,10 @@ class RMT(TTAMethod):
             変数名の fts は features の fts.
         """
         assert (source, warmup).count(True) <= 1
+        self.optimizers['optimizer'].zero_grad()
+        if self.hparams['architecture']['domain_embedding_pos'] and self.hparams['architecture']['domain_embedding_pos'] != 'adversarial':
+                self.optimizers['domain_optimizer'].zero_grad()
+            
         x_cls = self.normal_transform(x)  # (B, 3, 224, 224)
         image_fts = self.clip_model.encode_image(x_cls)  # (B, EMBEDDING_DIM)
 
@@ -212,16 +219,22 @@ class RMT(TTAMethod):
 
         ##### Domain Features, Loss
         if self.hparams['architecture']['domain_embedding_pos']:
-            domain_loss = self._learning__get_domain_loss(x)
-            self.scaler.scale(domain_loss).backward()
-            self.scaler.step(self.optimizers['domain_optimizer'])
-            self.scaler.update()
+            x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
+            image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
+            domain_loss = self._get_domain_loss(image_clsdst_fts)
+            if self.hparams['architecture']['domain_embedding_pos'] == 'adversarial':
+                self.scaler.scale(domain_loss).backward()
+                self.scaler.step(self.optimizers['optimizer'])
+                self.scaler.update()
+            else:
+                self.scaler.scale(domain_loss).backward()
+                self.scaler.step(self.optimizers['domain_optimizer'])
+                self.scaler.update()
+                
         
         ##### Class Features, Loss, Concat Text Features.
-        self.optimizers['optimizer'].zero_grad()
-
-        logits_st, norm_image_fts, middle_fts = self._learning__get_sttc_logits(self.models['model_st'], image_fts)  # (B, num_classes)
-        logits_ema, _, _ = self._learning__get_sttc_logits(self.models['model_ema'], image_fts, middle_fts)  # (B, num_classes)
+        logits_st, norm_image_fts, middle_fts = self._get_sttc_logits(self.models['model_st'], image_fts)  # (B, num_classes)
+        logits_ema, _, _ = self._get_sttc_logits(self.models['model_ema'], image_fts, middle_fts)  # (B, num_classes)
 
         if warmup:
             ##### Warm Up
@@ -235,7 +248,7 @@ class RMT(TTAMethod):
             ##### Forward Process
             x_aug = self.tta_transform(x_cls)
             image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
-            logits_aug, norm_image_aug_fts, _ = self._learning__get_sttc_logits(self.models['model_st'], image_aug_fts)  # (B, num_classes)
+            logits_aug, norm_image_aug_fts, _ = self._get_sttc_logits(self.models['model_st'], image_aug_fts)  # (B, num_classes)
             # Loss
             # 式(6)
             loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
@@ -266,8 +279,6 @@ class RMT(TTAMethod):
                 # 式(9)のうち, targetドメインに対するLoss (第2項)
                 loss_trg += self.lambda_cont * loss_contrastive
             
-            # loss_trg.backward()
-            # self.optimizer.step()
             self.scaler.scale(loss_trg).backward()
             self.scaler.step(self.optimizers['optimizer'])
             self.scaler.update()
@@ -309,7 +320,7 @@ class RMT(TTAMethod):
             return logits
 
 
-    def _learning__get_sttc_logits(self, model, image_fts, middle_fts=None):
+    def _get_sttc_logits(self, model, image_fts, middle_fts=None):
         """
             'sttc' stand for Student or Teacher.
             middle_fts: CLIPのimage_encoderからの特徴量, またはbase_modelを通した後の特徴量
@@ -353,18 +364,18 @@ class RMT(TTAMethod):
         return logits, norm_image_fts, middle_fts
 
 
-    def _learning__get_domain_loss(self, x):
+    def _get_domain_loss(self, image_clsdst_fts):
         assert self.hparams['architecture']['domain_embedding_pos']
-        self.optimizers['domain_optimizer'].zero_grad()
-        x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
-        # Features
-        image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
+        if self.hparams['architecture']['domain_embedding_pos'] == 'adversarial':
+            middle_clsdst_fts = self.models['model_st'](image_clsdst_fts)
+        else:
+            middle_clsdst_fts = image_clsdst_fts
 
         if self.hparams['architecture']['base_model']:
-            base_clsdst_fts = self.models['base_model'](image_clsdst_fts)  # (B, EMBEDDING_DIM)
+            base_clsdst_fts = self.models['base_model'](middle_clsdst_fts)  # (B, EMBEDDING_DIM)
             domain_fts = self.models['domain_projector'](base_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
         else:
-            domain_fts = self.models['domain_projector'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            domain_fts = self.models['domain_projector'](middle_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
 
         domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
 
@@ -658,7 +669,7 @@ def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
                                                             hparams
                                                             ).to(device=device, dtype=clip_model_dtype)
         if hparams['architecture']['domain_embedding_pos'] == 'adversarial':
-            return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM * hparams['num_domain_tokens'], EMBEDDING_DIM)).to(device=device, dtype=clip_model_dtype)
+            return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM * hparams['num_domain_tokens'], EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
         else:
             return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
         # if hparams['pretrain']['load']:
@@ -690,12 +701,18 @@ def set_optimizers(hparams, models):
     domain_args_params = []
     ###### optimizerのparamsに代入する各モデルのparameters
     for model_name, model in models.items():
-        if model_name in ['model_st', 'model_ema', 'base_model', 'projector']:
-            class_args_params.append({'params': model.parameters()})
-        elif model_name in ['domain_projector', 'mine']:
-            domain_args_params.append({'params': model.parameters()})
+        if hparams['architecture']['domain_embedding_pos'] == 'adversarial':
+            if model_name in ['model_st', 'model_ema', 'base_model', 'projector', 'domain_projector', 'mine']:
+                class_args_params.append({'params': model.parameters()})
+            else:
+                raise NotImplementedError(model_name)
         else:
-            raise NotImplementedError(model_name)
+            if model_name in ['model_st', 'model_ema', 'base_model', 'projector']:
+                class_args_params.append({'params': model.parameters()})
+            elif model_name in ['domain_projector', 'mine']:
+                domain_args_params.append({'params': model.parameters()})
+            else:
+                raise NotImplementedError(model_name)
     optimizers = {}
     ###### optimizerのpartial関数
     if hparams['optimizer'] == "Adam":
