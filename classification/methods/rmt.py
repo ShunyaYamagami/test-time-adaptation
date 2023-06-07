@@ -38,10 +38,14 @@ class RMT(TTAMethod):
         logger.info(f"----- RMT __init__ -----")
         ####################################################################################
         ####################################################################################
-        # if hparams['cuda_visible_devices'] == [0]:
-        #     hparams['architecture'] = 'USE_BASE_MODEL'
-        # elif hparams['cuda_visible_devices'] == [2]:
-        #     hparams['architecture'] = 'DOMAIN_FIRST'
+        if hparams['cuda_visible_devices'] == [0]:
+            hparams['architecture']['domain_embedding_pos'] = 'sepdim'
+            hparams['architecture']['domain_token_dim'] = 0
+            hparams['pretrain']['load'] = False
+        elif hparams['cuda_visible_devices'] == [2]:
+            hparams['architecture']['domain_embedding_pos'] = 'sepdim'
+            hparams['architecture']['domain_token_dim'] = 8
+            hparams['pretrain']['load'] = False
         ####################################################################################
         ####################################################################################
         self.cfg = cfg
@@ -50,9 +54,9 @@ class RMT(TTAMethod):
         assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
         assert self.hparams['architecture']['base_model'] in [False, 'mlp', 'my_transformer']
-        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'first', 'cat']
+        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'first', 'cat']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
-        assert self.hparams['architecture']['domain_embedding_pos'] in ['first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
+        assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
         assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] == 'cat' or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
         assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load_model'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
@@ -322,14 +326,17 @@ class RMT(TTAMethod):
         mean_sttc_fts = sttc_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
         repeated_sttc_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
 
-        if self.hparams['architecture']['domain_embedding_pos'] == 'cat':
+        if self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'cat']:
             norm_sttc_fts = F.normalize(repeated_sttc_fts)  # 正規化. (num_classes, EMBEDDING_DIM * num_domain_tokens)
             with torch.no_grad():
                 domain_fts = self.models['domain_projector'](middle_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
                 mean_domain_fts = domain_fts.mean(dim=0, keepdim=True)
                 repeated_domain_fts = mean_domain_fts.repeat_interleave(self.num_classes, dim=0)
                 norm_domain_fts = F.normalize(repeated_domain_fts)
-            leanable_parameters = norm_sttc_fts + norm_domain_fts
+            if self.hparams['architecture']['domain_embedding_pos'] == 'sepdim':
+                leanable_parameters = torch.cat([norm_domain_fts, norm_sttc_fts], dim=1)
+            elif self.hparams['architecture']['domain_embedding_pos'] == 'cat':
+                leanable_parameters = norm_domain_fts + norm_sttc_fts
         else:
             leanable_parameters = repeated_sttc_fts
 
@@ -411,8 +418,11 @@ class RMT(TTAMethod):
         return:
             class_domain_fts + text feature 
         """
-        assert class_domain in ["class", "domain"], f"Invalid class_domain: {class_domain}. class_domain must be 'class' or 'domain'"
-        class_domain_fts = class_domain_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
+        assert class_domain in ["class", "domain"]
+        if class_domain == 'domain' and self.hparams['architecture']['domain_embedding_pos'] == 'sepdim':
+            class_domain_fts = class_domain_fts.reshape(-1, self.hparams['architecture']['domain_token_dim'], self.EMBEDDING_DIM)  # (L, domain_token_dim, EMBEDDING_DIM)
+        else:
+            class_domain_fts = class_domain_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
         
         if class_domain == "class":
             param_fts = torch.cat([self.tokens['token_prefix'], class_domain_fts, self.tokens['token_suffix']], dim=1)  # (L, 77, EMBEDDING_DIM)
@@ -579,12 +589,20 @@ def set_clip_models(hparams, device, class_names):
     
     ##### Domain Prompt用  refer DPLCLIP
     if hparams['architecture']['domain_embedding_pos']:
-        domain_prompts = prompt_prefix + 'a photo of a '
-        tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
-        domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
-        # self.register_buffer('domain_token_prefix', domain_embedding[:, :1, :])  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['domain_token_prefix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['domain_token_suffix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+        if hparams['architecture']['domain_embedding_pos'] == 'sepdim':
+            domain_prompt_prefix = ' '.join(['X'] * hparams['architecture']['domain_token_dim'])
+            domain_prompts = domain_prompt_prefix + 'a photo of a '
+            tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
+            domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
+            tokens['domain_token_prefix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
+            tokens['domain_token_suffix'] = domain_embedding[:, hparams['architecture']['domain_token_dim'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+        else:
+            domain_prompts = prompt_prefix + 'a photo of a '
+            tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
+            domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
+            # self.register_buffer('domain_token_prefix', domain_embedding[:, :1, :])  # SOS (1, 1, EMBEDDING_DIM)
+            tokens['domain_token_prefix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
+            tokens['domain_token_suffix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
         
     return clip_model, tokens
 
@@ -605,21 +623,23 @@ def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
     return_models = {}
     def init_weights(m):
         if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform(m.weight)
+            torch.nn.init.xavier_uniform_(m.weight)
             m.bias.data.fill_(0.01)
     ##### Student model
     input_dim = EMBEDDING_DIM * hparams['num_domain_tokens'] \
         if hparams['architecture']['domain_embedding_pos'] == 'first' else EMBEDDING_DIM
+    output_dim = EMBEDDING_DIM * (hparams['num_domain_tokens'] - hparams['architecture']['domain_token_dim']) \
+        if hparams['architecture']['domain_embedding_pos'] == 'sepdim' else EMBEDDING_DIM * hparams['num_domain_tokens']
     return_models['model_st'] = networks.MLP(input_dim,
-                                            EMBEDDING_DIM * hparams['num_domain_tokens'],
+                                            output_dim,
                                             hparams
                                             ).to(device=device, dtype=clip_model_dtype)
-    # if hparams['pretrain']['load']:
-    #     model_path = os.path.join(pretrained_dir, f"best_model.pth")
-    #     return_models['model_st'].load_state_dict(torch.load(model_path))
-    #     logger.info(f'----- loaded pre-trained model_st from {model_path} -----')
-    # else:
-    return_models['model_st'].apply(init_weights)
+    if hparams['pretrain']['load']:
+        model_path = os.path.join(pretrained_dir, f"best_model.pth")
+        return_models['model_st'].load_state_dict(torch.load(model_path))
+        logger.info(f'----- loaded pre-trained model_st from {model_path} -----')
+    else:
+        return_models['model_st'].apply(init_weights)
 
     ##### Teacher model
     return_models['model_ema'] = TTAMethod.copy_model(return_models['model_st'])
@@ -642,8 +662,13 @@ def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
                                                     ).to(device=device, dtype=clip_model_dtype)
     ##### Domain Projector
     if hparams['architecture']['domain_embedding_pos']:
-        return_models['domain_projector'] = \
-            nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
+        if hparams['architecture']['domain_embedding_pos'] == 'sepdim':
+            return_models['domain_projector'] = networks.MLP(EMBEDDING_DIM,
+                                                            EMBEDDING_DIM * hparams['architecture']['domain_token_dim'],
+                                                            hparams
+                                                            ).to(device=device, dtype=clip_model_dtype)
+        else:
+            return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
         # if hparams['pretrain']['load']:
         #     model_path = os.path.join(pretrained_dir, f"domain_projector.pth")
         #     return_models['domain_projector'].load_state_dict(torch.load(model_path))
