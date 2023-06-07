@@ -212,7 +212,10 @@ class RMT(TTAMethod):
 
         ##### Domain Features, Loss
         if self.hparams['architecture']['domain_embedding_pos']:
-            self._learning__backward_domain_loss(x)
+            domain_loss = self._learning__get_domain_loss(x)
+            self.scaler.scale(domain_loss).backward()
+            self.scaler.step(self.optimizers['domain_optimizer'])
+            self.scaler.update()
         
         ##### Class Features, Loss, Concat Text Features.
         self.optimizers['optimizer'].zero_grad()
@@ -350,7 +353,8 @@ class RMT(TTAMethod):
         return logits, norm_image_fts, middle_fts
 
 
-    def _learning__backward_domain_loss(self, x):
+    def _learning__get_domain_loss(self, x):
+        assert self.hparams['architecture']['domain_embedding_pos']
         self.optimizers['domain_optimizer'].zero_grad()
         x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
         # Features
@@ -367,34 +371,20 @@ class RMT(TTAMethod):
         image_clsdst_fts = F.normalize(image_clsdst_fts)
         domain_text_fts = F.normalize(domain_text_fts)
         
-        # Loss
-        domain_loss = self._get_domain_loss(image_clsdst_fts, domain_text_fts)
-        self.scaler.scale(domain_loss).backward()
-        self.scaler.step(self.optimizers['domain_optimizer'])
-        self.scaler.update()
-    
-
-    def _get_domain_loss(self, image_clsdst_features, domain_text_features):
-        """
-            image_clsdst_features: (B, EMBEDDING_DIM)
-            domain_text_features: (B, EMBEDDING_DIM)
-        """
-        assert self.hparams['architecture']['domain_embedding_pos']
         if self.hparams['domain_loss']['method'] == "nt_xent":
-            domain_loss = self.ntxent_criterion(image_clsdst_features, domain_text_features)
+            domain_loss = self.ntxent_criterion(image_clsdst_fts, domain_text_fts)
         elif self.hparams['domain_loss']['method'] == 'mine':
-            # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う．
-            # そのため，バッチサイズは大きめでなくてはならない.
+            # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う. そのため，バッチサイズは大きめでなくてはならない.
             sim_mtx = F.cosine_similarity(
-                    x1=image_clsdst_features.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
-                    x2=domain_text_features.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
+                    x1=image_clsdst_fts.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
+                    x2=domain_text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
                     dim=-1).detach().cpu().numpy()  # (B, B)
 
             bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
             clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
 
             diag = torch.diag(clustered_mtx).long()
-            mean_feat_per_clust = [domain_text_features[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
+            mean_feat_per_clust = [domain_text_fts[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
 
             domain_loss = 0.
             for i in range(len(mean_feat_per_clust)):
@@ -667,6 +657,8 @@ def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
                                                             EMBEDDING_DIM * hparams['architecture']['domain_token_dim'],
                                                             hparams
                                                             ).to(device=device, dtype=clip_model_dtype)
+        if hparams['architecture']['domain_embedding_pos'] == 'adversarial':
+            return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM * hparams['num_domain_tokens'], EMBEDDING_DIM)).to(device=device, dtype=clip_model_dtype)
         else:
             return_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
         # if hparams['pretrain']['load']:

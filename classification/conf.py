@@ -411,7 +411,7 @@ def set_hparams():
             'prompt_tuning': True,  # promt tuningを行うか否か
             'base_model': False,  # choice([False, 'mlp', 'my_transformer']),
             'domain_embedding_pos': 'sepdim',  # choice([False, 'sepdim', 'adversarial', 'first', 'cat']),
-            'domain_token_dim': 1,  # num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
+            'domain_token_dim': 1,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "pretrain": {
             'load': False,
