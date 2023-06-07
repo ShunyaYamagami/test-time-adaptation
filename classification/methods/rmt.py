@@ -41,7 +41,7 @@ class RMT(TTAMethod):
         if hparams['cuda_visible_devices'] == [0]:
             hparams['architecture']['domain_embedding_pos'] = False
             hparams['architecture']['domain_token_dim'] = 0
-            hparams['pretrain']['load'] = False
+            hparams['pretrain']['load'] = True
         elif hparams['cuda_visible_devices'] == [2]:
             hparams['architecture']['domain_embedding_pos'] = 'adversarial'
             hparams['architecture']['domain_token_dim'] = 8
@@ -53,11 +53,10 @@ class RMT(TTAMethod):
         assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
         assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
-        assert self.hparams['architecture']['base_model'] in [False, 'mlp', 'my_transformer']
         assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'adversarial', 'first', 'cat']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'adversarial', 'first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
-        assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] == 'cat' or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
+        assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] in [False, 'cat'] or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
         assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load_model'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
@@ -66,7 +65,7 @@ class RMT(TTAMethod):
         ########## Set save_dir ##########
         if self.hparams['rename_save_dir']:
             old_save_dir = save_dir
-            dirname = f"{'_'.join(Path(old_save_dir).name.split('_')[:3])}--base_{hparams['architecture']['base_model']}--warm_{hparams['warmup']['use']}--proto_{hparams['prototypes']['use']}--domain_{hparams['domain_loss']['method']}"
+            dirname = f"{'_'.join(Path(old_save_dir).name.split('_')[:3])}--warm_{hparams['warmup']['use']}--proto_{hparams['prototypes']['use']}--domain_{hparams['domain_loss']['method']}"
             dirname = dirname.replace('False', 'F').replace('True', 'T').replace('my_transformer', 'tf')
             save_dir = str(Path(old_save_dir).parent / dirname)
             os.rename(old_save_dir, save_dir)
@@ -328,9 +327,7 @@ class RMT(TTAMethod):
         """
         ##### Get Middle Features
         if middle_fts is None:
-            if self.hparams['architecture']['base_model']:
-                middle_fts = self.models['base_model'](image_fts)  # (B, EMBEDDING_DIM)
-            elif self.hparams['architecture']['domain_embedding_pos'] == 'first':
+            if self.hparams['architecture']['domain_embedding_pos'] == 'first':
                 middle_fts = self.models['domain_projector'](image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
             else:
                 middle_fts = image_fts  # (B, EMBEDDING_DIM)
@@ -371,11 +368,7 @@ class RMT(TTAMethod):
         else:
             middle_clsdst_fts = image_clsdst_fts
 
-        if self.hparams['architecture']['base_model']:
-            base_clsdst_fts = self.models['base_model'](middle_clsdst_fts)  # (B, EMBEDDING_DIM)
-            domain_fts = self.models['domain_projector'](base_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        else:
-            domain_fts = self.models['domain_projector'](middle_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        domain_fts = self.models['domain_projector'](middle_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
 
         domain_text_fts = self._cat_class_domain_text_features(domain_fts, class_domain="domain")  # (B, EMBEDDING_DIM)
 
@@ -647,20 +640,6 @@ def set_models(hparams, device, EMBEDDING_DIM, clip_model_dtype, dataset_name,
     for param in return_models['model_ema'].parameters():
         param.detach_()
 
-    ##### Base Model
-    if hparams['architecture']['base_model'] == "mlp":
-        return_models['base_model'] = networks.MLP(EMBEDDING_DIM,
-                                                    EMBEDDING_DIM,
-                                                    hparams
-                                                    ).to(device=device, dtype=clip_model_dtype)
-    elif hparams['architecture']['base_model'] == "my_transformer":
-        return_models['base_model'] = MyTransformer(width=EMBEDDING_DIM,
-                                                    out_width=EMBEDDING_DIM,
-                                                    layers=12,
-                                                    heads=8,
-                                                    context_length=src_batch_size,
-                                                    attn_mask="build_attention_mask"
-                                                    ).to(device=device, dtype=clip_model_dtype)
     ##### Domain Projector
     if hparams['architecture']['domain_embedding_pos']:
         if hparams['architecture']['domain_embedding_pos'] == 'sepdim':
@@ -702,12 +681,12 @@ def set_optimizers(hparams, models):
     ###### optimizerのparamsに代入する各モデルのparameters
     for model_name, model in models.items():
         if hparams['architecture']['domain_embedding_pos'] == 'adversarial':
-            if model_name in ['model_st', 'model_ema', 'base_model', 'projector', 'domain_projector', 'mine']:
+            if model_name in ['model_st', 'model_ema', 'projector', 'domain_projector', 'mine']:
                 class_args_params.append({'params': model.parameters()})
             else:
                 raise NotImplementedError(model_name)
         else:
-            if model_name in ['model_st', 'model_ema', 'base_model', 'projector']:
+            if model_name in ['model_st', 'model_ema', 'projector']:
                 class_args_params.append({'params': model.parameters()})
             elif model_name in ['domain_projector', 'mine']:
                 domain_args_params.append({'params': model.parameters()})
