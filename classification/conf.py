@@ -410,8 +410,7 @@ def set_hparams():
         "architecture": {
             'prompt_tuning': True,  # promt tuningを行うか否か
             'learnable_parameters': True,
-            # 'domain_embedding_pos': 'sepdim',  # choice([False, 'sepdim', 'adversarial', 'first', 'cat']),
-            'domain_embedding_pos': False,  # choice([False, 'sepdim', 'adversarial', 'first', 'cat']),
+            'domain_embedding_pos': False,  # choice([False, 'sepdim', 'adversarial', 'first']),
             'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "pretrain": {

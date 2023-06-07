@@ -53,10 +53,10 @@ class RMT(TTAMethod):
         assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
         assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['optimizer'] in ['Adam', 'SGD']
-        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'adversarial', 'first', 'cat']
+        assert self.hparams['architecture']['domain_embedding_pos'] in [False, 'sepdim', 'adversarial', 'first']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
-        assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'adversarial', 'first', 'cat'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
-        assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] in [False, 'cat'] or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
+        assert self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'adversarial', 'first'] and self.hparams['domain_loss']['method'] in ['nt_xent', 'mine'] or not self.hparams['architecture']['domain_embedding_pos']
+        assert self.hparams['pretrain']['load'] and self.hparams['architecture']['domain_embedding_pos'] in [False] or not self.hparams['pretrain']['load'], "domain_embedding_posをfirstにした場合, Student Modelの入力サイズが異なるが, これが未対応. "
         assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load_model'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['prototypes']['load'] and self.hparams['prototypes']['use'] or not self.hparams['prototypes']['load'], "if load is True, use must be True"
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
@@ -337,7 +337,7 @@ class RMT(TTAMethod):
         mean_sttc_fts = sttc_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
         repeated_sttc_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
 
-        if self.hparams['architecture']['domain_embedding_pos'] in ['sepdim', 'cat']:
+        if self.hparams['architecture']['domain_embedding_pos'] in ['sepdim']:
             norm_sttc_fts = F.normalize(repeated_sttc_fts)  # 正規化. (num_classes, EMBEDDING_DIM * num_domain_tokens)
             with torch.no_grad():
                 domain_fts = self.models['domain_projector'](middle_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
@@ -346,8 +346,6 @@ class RMT(TTAMethod):
                 norm_domain_fts = F.normalize(repeated_domain_fts)
             if self.hparams['architecture']['domain_embedding_pos'] == 'sepdim':
                 leanable_parameters = torch.cat([norm_domain_fts, norm_sttc_fts], dim=1)
-            elif self.hparams['architecture']['domain_embedding_pos'] == 'cat':
-                leanable_parameters = norm_domain_fts + norm_sttc_fts
         else:
             leanable_parameters = repeated_sttc_fts
 
