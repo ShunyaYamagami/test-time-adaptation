@@ -71,17 +71,17 @@ class MineTrainer():
         return loss, mi_lb
 
 
-    def train(self, data, iter_num=int(5e+3), log_freq=int(1e+3)):
-        result = []
-        for i in range(iter_num):
-            self.mine_optim.zero_grad()
-            loss, mi_lb = self.get_loss(data)
-            loss.backward()
-            self.mine_optim.step()
+    # def train(self, data, iter_num=int(5e+3), log_freq=int(1e+3)):
+    #     result = []
+    #     for i in range(iter_num):
+    #         self.mine_optim.zero_grad()
+    #         loss, mi_lb = self.get_loss(data)
+    #         loss.backward()
+    #         self.mine_optim.step()
 
-            result.append(mi_lb.detach().cpu().numpy())
+    #         result.append(mi_lb.detach().cpu().numpy())
 
-            # if (i + 1) % (log_freq) == 0:
-            #     print(result[-1])
-        return result
+    #         # if (i + 1) % (log_freq) == 0:
+    #         #     print(result[-1])
+    #     return result
 
