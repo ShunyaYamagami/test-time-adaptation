@@ -418,7 +418,7 @@ def set_hparams():
         },
         "warmup": {
             "use": True,
-            "load": True,
+            "load": False,
         },
         "prototypes": {
             "use": False,

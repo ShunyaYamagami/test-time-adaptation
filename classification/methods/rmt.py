@@ -46,7 +46,7 @@ class RMT(TTAMethod):
             hparams['domain_loss']['prompt'] = False
         elif hparams['cuda_visible_devices'] == [2]:
             hparams['architecture']['domain_learning'] = False
-            hparams['architecture']['learnable_parameters'] = False
+            hparams['architecture']['learnable_parameters'] = True
             hparams['warmup']['use'] = True
             hparams['warmup']['load'] = False
             hparams['domain_loss']['prompt'] = False
@@ -59,7 +59,6 @@ class RMT(TTAMethod):
         assert self.hparams['sttc'] in ['linear', 'mlp']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['domain_loss']['prompt'] in [False, 'classname']
-        assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['warmup']['load'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load'], "if load_model is True, use must be True"
         assert self.hparams['warmup']['use'] and num_samples_warm_up > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
 
@@ -90,13 +89,13 @@ class RMT(TTAMethod):
                 
         self.clip_model, preprocess = clip.load(hparams['clip_backbone'], device=self.device)
         self.clip_model = self.clip_model.float()
-        if not hparams['architecture']['learnable_parameters']:
-            logger.info('Set self.clip_model.parameters.reguires_grad = False!')
-            for param in self.clip_model.parameters():
-                param.requires_grad = False
+        logger.info('Set self.clip_model.parameters.reguires_grad = False!')
+        for param in self.clip_model.parameters():
+            param.requires_grad = False
         self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, self.device)
         self.prompt_learner = PromptLearner(hparams, self.clip_model, class_names, num_classes, self.device)
-        self.models['prompt_learner'] = self.prompt_learner
+        if self.hparams['architecture']['learnable_parameters']:
+            self.models['prompt_learner'] = self.prompt_learner
         self.optimizers = set_optimizers(hparams, self.models)
         
         self.prototypes_src = None
@@ -179,7 +178,7 @@ class RMT(TTAMethod):
                 x = src_batch[0].to(self.device)
                 y = src_batch[1].to(self.device)
                 logits = self.learning(x, y)
-                if i % 100 == 0:
+                if i % 50 == 0:
                     acc = logits.argmax(dim=1).eq(y).sum().item() / y.size(0)
                     logger.info(f"step: {i}\tacc: {acc*100:.2f}%")
 
@@ -424,11 +423,13 @@ def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
 class PromptLearner(nn.Module):
     def __init__(self, hparams, clip_model, class_names, num_classes, device):
         super().__init__()
+        self.hparams = hparams
         self.num_classes = num_classes
         template = 'a photo of a'
         n_ctx = hparams['num_domain_tokens']
         ctx_dim = clip_model.ln_final.weight.shape[0]
         ctx_init = template
+        # if hparams['architecture']['learnable_parameters']:
         if ctx_init:  ##### TODO: ランダムに初期化する方が良い？
             ctx_init = ctx_init.replace(" {}.", "")
             ctx_init = ctx_init.replace("_", " ")
@@ -446,9 +447,7 @@ class PromptLearner(nn.Module):
             prompt_prefix = " ".join(["X"] * n_ctx)
 
         self.ctx = nn.Parameter(ctx_vectors)
-        if not hparams['architecture']['learnable_parameters']:
-            self.ctx.requires_grad = False
-        prompt_prefix = template
+
         logger.info(f'Initial context: "{prompt_prefix}"')
         logger.info(f"Number of context words (tokens): {n_ctx}")
 
@@ -489,7 +488,11 @@ class PromptLearner(nn.Module):
             suffix = self.tokens['domain_token_suffix']
             tokenized_prompts = self.tokens['domain_tokenized_prompts']
             
-        ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+        if self.hparams['architecture']['learnable_parameters']:
+            ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+        else:
+            ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+
         prompts = torch.cat([prefix, ctx, suffix], dim=1)
         
         return prompts, tokenized_prompts
