@@ -39,10 +39,10 @@ class RMT(TTAMethod):
         ####################################################################################
         ####################################################################################
         if hparams['cuda_visible_devices'] == [0]:
-            hparams['architecture']['domain_learning'] = False
+            hparams['architecture']['domain_learning'] = True
             hparams['domain_loss']['use_domain_projector'] = False
         elif hparams['cuda_visible_devices'] == [2]:
-            hparams['architecture']['domain_learning'] = False
+            hparams['architecture']['domain_learning'] = True
             hparams['domain_loss']['use_domain_projector'] = False
         ####################################################################################
         ####################################################################################
@@ -95,7 +95,7 @@ class RMT(TTAMethod):
                 self.warmup_trainer.warmup()
         self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, device)
         self.optimizers = set_optimizers(hparams, self.models)
-        self.self_trainer = SelfTrainer(hparams, self.clip_model, self.tokens, self.EMBEDDING_DIM, self.normal_transform, num_classes, dataset_name, device)
+        self.self_trainer = SelfTrainer(hparams, self.clip_model, self.tokens, self.EMBEDDING_DIM, self.normal_transform, lambda_ce_trg, num_classes, dataset_name, device)
         if self.hparams['architecture']['domain_learning']:
             self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.tokens, self.models['mine'], self.EMBEDDING_DIM, self.clsdst_transform, self.src_loader.batch_size, device)
         self.final_lr = self.optimizers.param_groups[0]['lr']
@@ -164,10 +164,9 @@ class TextEncoder(nn.Module):
         """
             tokenized_prompts (L, 77)
         """
-        # fts = fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
-
-        batch_size = fts.shape[0]
+        fts = fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
         if self.token_prefix.shape[0] == 1:
+            batch_size = fts.shape[0]
             token_prefix = self.token_prefix.repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
             token_suffix = self.token_suffix.repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
         else:
@@ -187,13 +186,14 @@ class TextEncoder(nn.Module):
         
 
 class SelfTrainer(nn.Module):
-    def __init__(self, hparams, clip_model, tokens, EMBEDDING_DIM, normal_transform, num_classes, dataset_name, device):
+    def __init__(self, hparams, clip_model, tokens, EMBEDDING_DIM, normal_transform, lambda_ce_trg, num_classes, dataset_name, device):
         super().__init__()
         self.hparams = hparams
         self.clip_model = clip_model
         self.tokens = tokens
         self.EMBEDDING_DIM = EMBEDDING_DIM
         self.normal_transform = normal_transform
+        self.lambda_ce_trg = lambda_ce_trg
         self.tta_transform = get_tta_transforms(dataset_name)
         self.num_classes = num_classes
         self.device = device
@@ -208,10 +208,8 @@ class SelfTrainer(nn.Module):
         logits_ema = self.get_logits(models['model_ema'], image_fts)  # (B, num_classes)
         logits_aug = self.get_logits(models['model_st'], image_aug_fts)  # (B, num_classes)
         
-        # Loss 式(6)
-        loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
-        # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
-        loss_trg = loss_entropy
+        loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)  # Loss 式(6)
+        loss_trg = self.lambda_ce_trg * loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
 
         return loss_trg, logits_st, logits_ema
         
@@ -390,11 +388,10 @@ def set_clip_models(hparams, device, class_names):
         with torch.no_grad():
             embedding = clip_model.token_embedding(prompt).type(clip_model.dtype)
 
-        ctx_vectors = torch.zeros(n_ctx, ctx_dim, dtype=clip_model.dtype)
-
-        ctx_vectors[n_ctx - prompt_n_ctx:, :] = embedding[0, 1:1 + prompt_n_ctx, :]
-        prompt_prefix = " ".join(["X"] * (n_ctx - prompt_n_ctx))
-        prompt_prefix = f"{prompt_prefix} {ctx_init}"  # [X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, 'a', 'photo', 'of', 'a']
+        # ctx_vectors = torch.zeros(n_ctx, ctx_dim, dtype=clip_model.dtype)
+        ctx_vectors = embedding[0, 1:1 + n_ctx, :]
+        prompt_prefix = " ".join(["X"] * n_ctx)
+        prompt_prefix = f"{prompt_prefix} {ctx_init}"  # X X X X X X X X X X X X X X X X 'a' 'photo' 'of' 'a'
     else:
         # random initialization
         ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=clip_model.dtype)
