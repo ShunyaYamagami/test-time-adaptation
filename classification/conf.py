@@ -167,9 +167,9 @@ _C.RMT = CfgNode()
 _C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
-# _C.RMT.NUM_SAMPLES_WARM_UP = 50000
-# _C.RMT.NUM_SAMPLES_WARM_UP = 500000
-_C.RMT.NUM_SAMPLES_WARM_UP = 500
+# _C.RMT.NUM_SAMPLES_WARM_UP = 5000
+_C.RMT.NUM_SAMPLES_WARM_UP = 100000
+# _C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分,
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()
@@ -418,7 +418,7 @@ def set_hparams():
         },
         "warmup": {
             "use": False,
-            "load_model": False,
+            "load": False,
         },
         "prototypes": {
             "use": False,
@@ -427,6 +427,7 @@ def set_hparams():
         'sttc': 'mlp',  # choice(['linear', 'mlp'])
         "domain_loss": {
             "use_domain_projector": False,
+            "prompt": 'classname',  # choice([False, 'classname'])
             "method": "mine",  # choice(['nt_xent', 'mine']),  Domain学習をするか否かは architecture の部分で制御する.
             "nt_xent_temperature": 0.5,
         },
