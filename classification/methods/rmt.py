@@ -427,10 +427,25 @@ def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
 
 
 def set_clip_models(hparams, device, class_names):
-    # embedding dim for image and text encoder.
-    logger.info(f"----- Set Clip Models,  clip_backbone : {hparams['clip_backbone']}  -----")
-    clip_model, preprocess = clip.load(hparams['clip_backbone'], device=device)
-    clip_model = clip_model.float()
+    def load_clip_to_cpu(backbone_name):
+        logger.info(f"----- Set Clip Models,  clip_backbone : {backbone_name}  -----")
+        url = clip._MODELS[backbone_name]
+        model_path = clip._download(url)
+
+        try:
+            # loading JIT archive
+            model = torch.jit.load(model_path, map_location="cpu").eval()
+            state_dict = None
+
+        except RuntimeError:
+            state_dict = torch.load(model_path, map_location="cpu")
+
+        model = clip.build_model(state_dict or model.state_dict())
+
+        return model
+    clip_model = load_clip_to_cpu(hparams['clip_backbone'])
+    # clip_model, preprocess = clip.load(hparams['clip_backbone'], device=device)
+    # clip_model = clip_model.float()
 
     # logger.info('Set self.clip_model.parameters.reguires_grad = False!')
     # for param in clip_model.parameters():
