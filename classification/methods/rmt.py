@@ -40,11 +40,15 @@ class RMT(TTAMethod):
         ####################################################################################
         if hparams['cuda_visible_devices'] == [0]:
             hparams['architecture']['domain_learning'] = False
-            # hparams['architecture']['learnable_parameters'] = False
-            hparams['domain_loss']['prompt'] = 'classname'
+            hparams['architecture']['learnable_parameters'] = True
+            hparams['warmup']['use'] = True
+            hparams['warmup']['load'] = False
+            hparams['domain_loss']['prompt'] = False
         elif hparams['cuda_visible_devices'] == [2]:
             hparams['architecture']['domain_learning'] = False
-            # hparams['architecture']['learnable_parameters'] = False
+            hparams['architecture']['learnable_parameters'] = False
+            hparams['warmup']['use'] = True
+            hparams['warmup']['load'] = False
             hparams['domain_loss']['prompt'] = False
         ####################################################################################
         ####################################################################################
@@ -84,8 +88,15 @@ class RMT(TTAMethod):
         self.normal_transform, self.clsdst_transform = get_transform_when_iteration(grid=4)
         self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])  # 自動的にレイヤ毎に最適なビット精度を選択してくれる（convはfp16, bnはfp32等）. ベストプラクティスを選択してくれるため、便利。use_amp=Falseではfp32を使用する。
                 
-        self.clip_model, self.tokens, self.ctx = set_clip_models(self.hparams, self.device, class_names)
+        self.clip_model, preprocess = clip.load(hparams['clip_backbone'], device=self.device)
+        self.clip_model = self.clip_model.float()
+        if not hparams['architecture']['learnable_parameters']:
+            logger.info('Set self.clip_model.parameters.reguires_grad = False!')
+            for param in self.clip_model.parameters():
+                param.requires_grad = False
         self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, self.device)
+        self.prompt_learner = PromptLearner(hparams, self.clip_model, class_names, num_classes, self.device)
+        self.models['prompt_learner'] = self.prompt_learner
         self.optimizers = set_optimizers(hparams, self.models)
         
         self.prototypes_src = None
@@ -96,9 +107,9 @@ class RMT(TTAMethod):
             else:
                 self.prototypes_src = prototype_runner()
             
-        self.self_trainer = SelfTrainer(hparams, self.clip_model, self.tokens, self.EMBEDDING_DIM, self.normal_transform, lambda_ce_trg, num_classes, dataset_name, self.device)
+        self.self_trainer = SelfTrainer(hparams, self.clip_model, self.EMBEDDING_DIM, self.normal_transform, lambda_ce_trg, num_classes, dataset_name, self.device)
         if self.hparams['architecture']['domain_learning']:
-            self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.tokens, self.prototypes_src, self.models['mine'], self.EMBEDDING_DIM, self.clsdst_transform, self.src_loader.batch_size, num_classes, self.device)
+            self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.prototypes_src, self.models['mine'], self.EMBEDDING_DIM, self.clsdst_transform, self.src_loader.batch_size, num_classes, self.device)
 
         if self.hparams['warmup']['use']:
             self.warmup_criterion = nn.CrossEntropyLoss()
@@ -113,11 +124,13 @@ class RMT(TTAMethod):
 
     def learning(self, x, y=None):
         self.optimizers.zero_grad()
-        self_train_loss, logits_st, logits_ema = self.self_trainer(x, self.models, self.ctx)
+        prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
+        self_train_loss, logits_st, logits_ema = self.self_trainer(x, self.models, prompts, tokenized_prompts)
         loss = self_train_loss
 
         if self.hparams['architecture']['domain_learning']:
-            domain_loss = self.domain_trainer(x, self.models, self.ctx)
+            domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
+            domain_loss = self.domain_trainer(x, self.models, domain_prompts, domain_tokenized_prompts)
             # loss += domain_loss
             loss -= domain_loss
         
@@ -201,31 +214,18 @@ class RMT(TTAMethod):
             
 class TextEncoder(nn.Module):
     """ refer CoCoOp """
-    def __init__(self, hparams, clip_model, EMBEDDING_DIM, token_prefix, token_suffix, num_classes):
+    def __init__(self, hparams, clip_model, EMBEDDING_DIM, num_classes):
         super().__init__()
         self.hparams = hparams
         self.transformer = clip_model.transformer
-        print('\n\n')
-        for name, param in self.transformer.named_parameters():
-            print(f'Parameter: {name}, requires_grad: {param.requires_grad}')
-        print('\n\n')
         self.positional_embedding = clip_model.positional_embedding
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
         self.EMBEDDING_DIM = EMBEDDING_DIM
-        if token_prefix.shape[0] == 1:
-            self.token_prefix = token_prefix.repeat_interleave(num_classes, dim=0)
-            self.token_suffix = token_suffix.repeat_interleave(num_classes, dim=0)
-        else:
-            self.token_prefix = token_prefix
-            self.token_suffix = token_suffix
         self.num_classes = num_classes
 
-    def forward(self, ctx, tokenized_prompts):
-        ctx = ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
-        prompt = torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
-    
+    def forward(self, prompt, tokenized_prompts):
         x = prompt + self.positional_embedding.type(self.dtype)  # (L, 77, EMBEDDING_DIM)
         x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
         x = self.transformer(x)  # (77, L, EMBEDDING_DIM)
@@ -237,40 +237,36 @@ class TextEncoder(nn.Module):
         
 
 class SelfTrainer(nn.Module):
-    def __init__(self, hparams, clip_model, tokens, EMBEDDING_DIM, normal_transform, lambda_ce_trg, num_classes, dataset_name, device):
+    def __init__(self, hparams, clip_model, EMBEDDING_DIM, normal_transform, lambda_ce_trg, num_classes, dataset_name, device):
         super().__init__()
         self.hparams = hparams
         self.clip_model = clip_model
-        self.tokens = tokens
         self.EMBEDDING_DIM = EMBEDDING_DIM
         self.normal_transform = normal_transform
         self.lambda_ce_trg = lambda_ce_trg
         self.tta_transform = get_tta_transforms(dataset_name)
         self.num_classes = num_classes
         self.device = device
-        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, self.tokens['token_prefix'], self.tokens['token_suffix'], num_classes)
+        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, num_classes)
 
-    def forward(self, x, models, ctx):
+    def forward(self, x, models, prompts, tokenized_prompts):
         x_trans = self.normal_transform(x)  # (B, 3, 224, 224)
         x_aug = self.tta_transform(x_trans)
         with torch.no_grad():
             image_fts = self.clip_model.encode_image(x_trans)  # (B, EMBEDDING_DIM)
             image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
-        logits_st = self.get_logits(models['model_st'], image_fts, ctx)  # (B, num_classes)
-        logits_ema = self.get_logits(models['model_ema'], image_fts, ctx)  # (B, num_classes)
-        logits_aug = self.get_logits(models['model_st'], image_aug_fts, ctx)  # (B, num_classes)
+        logits_st = self.get_logits(models['model_st'], image_fts, prompts, tokenized_prompts)  # (B, num_classes)
+        logits_ema = self.get_logits(models['model_ema'], image_fts, prompts, tokenized_prompts)  # (B, num_classes)
+        logits_aug = self.get_logits(models['model_st'], image_aug_fts, prompts, tokenized_prompts)  # (B, num_classes)
         
         loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)  # Loss 式(6)
         loss_trg = self.lambda_ce_trg * loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
 
         return loss_trg, logits_st, logits_ema
         
-    def get_logits(self, model, image_fts, ctx):
-        print(f"""
-            {ctx}
-        """)
+    def get_logits(self, model, image_fts, prompts, tokenized_prompts):
         sttc_fts = model(image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        text_fts = self.text_encoder(ctx, self.tokens['tokenized_prompts'])  # (num_classes, EMBEDDING_DIM)
+        text_fts = self.text_encoder(prompts, tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
         norm_sttc_fts = F.normalize(sttc_fts)
         norm_text_fts = F.normalize(text_fts)
         logits = self.clip_model.logit_scale.exp() * norm_sttc_fts @ norm_text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
@@ -278,18 +274,17 @@ class SelfTrainer(nn.Module):
 
 
 class DomainTrainer(nn.Module):
-    def __init__(self, hparams, clip_model, tokens, prototypes_src, mine, EMBEDDING_DIM, clsdst_transform, batch_size, num_classes, device):
+    def __init__(self, hparams, clip_model, prototypes_src, mine, EMBEDDING_DIM, clsdst_transform, batch_size, num_classes, device):
         super().__init__()
         assert hparams['domain_loss']['method'] in ['mine']
         self.hparams = hparams
         self.clip_model = clip_model
-        self.tokens = tokens
         self.prototypes_src = prototypes_src
         self.EMBEDDING_DIM = EMBEDDING_DIM
         self.clsdst_transform = clsdst_transform
         self.num_classes = num_classes
         self.device = device
-        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, self.tokens['domain_token_prefix'], self.tokens['domain_token_suffix'], num_classes)
+        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, num_classes)
         
         self.skp = skp.SinkhornKnopp()
         n_clusters=(2, 2)
@@ -299,12 +294,12 @@ class DomainTrainer(nn.Module):
         elif self.hparams['domain_loss']['method'] == 'nt_xent':
             self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
 
-    def forward(self, x, models, ctx):
+    def forward(self, x, models, prompts, tokenized_prompts):
         x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
         with torch.no_grad():
             image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
         st_clsdst_fts = models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        text_fts = self.text_encoder(ctx, self.tokens['domain_tokenized_prompts'])  # (B, EMBEDDING_DIM)
+        text_fts = self.text_encoder(prompts, tokenized_prompts)  # (B, EMBEDDING_DIM)
 
         mean_sttc_fts = st_clsdst_fts.mean(dim=0, keepdim=True)
         image_clsdst_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
@@ -426,83 +421,79 @@ def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
     return -0.5 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.5 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1)
 
 
-def set_clip_models(hparams, device, class_names):
-    def load_clip_to_cpu(backbone_name):
-        logger.info(f"----- Set Clip Models,  clip_backbone : {backbone_name}  -----")
-        url = clip._MODELS[backbone_name]
-        model_path = clip._download(url)
-
-        try:
-            # loading JIT archive
-            model = torch.jit.load(model_path, map_location="cpu").eval()
-            state_dict = None
-
-        except RuntimeError:
-            state_dict = torch.load(model_path, map_location="cpu")
-
-        model = clip.build_model(state_dict or model.state_dict())
-
-        return model
-    clip_model = load_clip_to_cpu(hparams['clip_backbone'])
-    # clip_model, preprocess = clip.load(hparams['clip_backbone'], device=device)
-    # clip_model = clip_model.float()
-
-    # logger.info('Set self.clip_model.parameters.reguires_grad = False!')
-    # for param in clip_model.parameters():
-    #     param.requires_grad = False
-
-    ##### Class Prompt用  refer DPLCLIP
-    template = 'a photo of a'
-    n_ctx = hparams['num_domain_tokens']
-    ctx_dim = clip_model.ln_final.weight.shape[0]
-    ctx_init = template
-    if ctx_init:  ##### TODO: ランダムに初期化する方が良い？
-        ctx_init = ctx_init.replace(" {}.", "")
-        ctx_init = ctx_init.replace("_", " ")
-        
-        prompt = clip.tokenize(ctx_init).cuda()
-        with torch.no_grad():
-            embedding = clip_model.token_embedding(prompt).type(clip_model.dtype)
-
-        # ctx_vectors = torch.zeros(n_ctx, ctx_dim, dtype=clip_model.dtype)
-        ctx_vectors = embedding[0, 1:1 + n_ctx, :]
-        prompt_prefix = " ".join(["X"] * n_ctx)
-        prompt_prefix = f"{prompt_prefix} {ctx_init}"  # X X X X X X X X X X X X X X X X 'a' 'photo' 'of' 'a'
-    else:
-        # random initialization
-        ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=clip_model.dtype)
-        nn.init.normal_(ctx_vectors, std=0.02)
-        prompt_prefix = " ".join(["X"] * n_ctx)
-
-    logger.info(f'Initial context: "{prompt_prefix}"')
-    logger.info(f"Number of context words (tokens): {n_ctx}")
-
-    ctx = nn.Parameter(ctx_vectors).cuda()
-
-    ##### to get default token_prefix and token_suffix.
-    tokens = {}
-    class_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
-    tokens['tokenized_prompts'] = torch.cat([clip.tokenize(p) for p in class_prompts]).to(device)  # (クラス数, 77)
-    with torch.no_grad():
-        embedding = clip_model.token_embedding(tokens['tokenized_prompts']).type(clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
-    tokens['token_prefix'] = embedding[:, :1, :]  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
-    tokens['token_suffix'] = embedding[:, 1 + n_ctx:, :]  # CLS, EOS (クラス数, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
-    
-    ##### Domain Prompt用
-    if hparams['architecture']['domain_learning']:
-        ##### TODO: ここをどう設計する？Prompt Distribution Learningぽくクラス名を付加させない？その場合類似度行列の列が単一になり，biclusteringもクソもない．
-        if hparams['domain_loss']['prompt'] == 'classname':
-            domain_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
+class PromptLearner(nn.Module):
+    def __init__(self, hparams, clip_model, class_names, num_classes, device):
+        super().__init__()
+        self.num_classes = num_classes
+        template = 'a photo of a'
+        n_ctx = hparams['num_domain_tokens']
+        ctx_dim = clip_model.ln_final.weight.shape[0]
+        ctx_init = template
+        if ctx_init:  ##### TODO: ランダムに初期化する方が良い？
+            ctx_init = ctx_init.replace(" {}.", "")
+            ctx_init = ctx_init.replace("_", " ")
+            
+            prompt = clip.tokenize(ctx_init).cuda()
+            with torch.no_grad():
+                embedding = clip_model.token_embedding(prompt).type(clip_model.dtype)
+            ctx_vectors = embedding[0, 1:1 + n_ctx, :]
+            prompt_prefix = " ".join(["X"] * n_ctx)
+            prompt_prefix = f"{prompt_prefix} {ctx_init}"  # X X X X X X X X X X X X X X X X 'a' 'photo' 'of' 'a'
         else:
-            domain_prompts = prompt_prefix
-            # raise ValueError('ここをどう設計する？Prompt Distribution Learningぽくクラス名を付加させない？その場合類似度行列の列が単一になり，biclusteringもクソもない．')
-        tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
+            # random initialization
+            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=clip_model.dtype)
+            nn.init.normal_(ctx_vectors, std=0.02)
+            prompt_prefix = " ".join(["X"] * n_ctx)
+
+        self.ctx = nn.Parameter(ctx_vectors)
+        if not hparams['architecture']['learnable_parameters']:
+            self.ctx.requires_grad = False
+        prompt_prefix = template
+        logger.info(f'Initial context: "{prompt_prefix}"')
+        logger.info(f"Number of context words (tokens): {n_ctx}")
+
+        ##### Class Prompt用  refer DPLCLIP
+        tokens = {}
+        class_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
+        tokens['tokenized_prompts'] = torch.cat([clip.tokenize(p) for p in class_prompts]).to(device)  # (クラス数, 77)
         with torch.no_grad():
-            domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
-        tokens['domain_token_prefix'] = domain_embedding[:, :1, :]  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['domain_token_suffix'] = domain_embedding[:, 1 + n_ctx:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+            embedding = clip_model.token_embedding(tokens['tokenized_prompts']).type(clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
+        tokens['token_prefix'] = embedding[:, :1, :]  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
+        tokens['token_suffix'] = embedding[:, 1 + n_ctx:, :]  # CLS, EOS (クラス数, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
         
-    return clip_model, tokens, ctx
+        ##### Domain Prompt用
+        if hparams['architecture']['domain_learning']:
+            ##### TODO: ここをどう設計する？Prompt Distribution Learningぽくクラス名を付加させない？その場合類似度行列の列が単一になり，biclusteringもクソもない．
+            if hparams['domain_loss']['prompt'] == 'classname':
+                domain_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
+            else:
+                domain_prompts = prompt_prefix
+            tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
+            with torch.no_grad():
+                domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
+            tokens['domain_token_prefix'] = domain_embedding[:, :1, :]  # SOS (1, 1, EMBEDDING_DIM)
+            tokens['domain_token_suffix'] = domain_embedding[:, 1 + n_ctx:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+            if tokens['domain_token_prefix'].shape[0] == 1:
+                tokens['domain_token_prefix'] = tokens['domain_token_prefix'].repeat_interleave(self.num_classes, dim=0)
+                tokens['domain_token_suffix'] = tokens['domain_token_suffix'].repeat_interleave(self.num_classes, dim=0)
+                
+        self.tokens = tokens
+
+    def forward(self, class_domain='class'):
+        if class_domain == 'class':
+            prefix = self.tokens['token_prefix']
+            suffix = self.tokens['token_suffix']
+            tokenized_prompts = self.tokens['tokenized_prompts']
+        else:
+            prefix = self.tokens['domain_token_prefix']
+            suffix = self.tokens['domain_token_suffix']
+            tokenized_prompts = self.tokens['domain_tokenized_prompts']
+            
+        ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+        prompts = torch.cat([prefix, ctx, suffix], dim=1)
+        
+        return prompts, tokenized_prompts
+            
 
 
 def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
