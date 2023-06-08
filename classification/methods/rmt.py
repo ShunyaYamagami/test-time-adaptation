@@ -39,19 +39,18 @@ class RMT(TTAMethod):
         ####################################################################################
         ####################################################################################
         if hparams['cuda_visible_devices'] == [0]:
-            hparams['architecture']['domain_learning'] = True
-            hparams['architecture']['domain_token_dim'] = 0
-            hparams['pretrain']['load'] = True
+            hparams['architecture']['domain_learning'] = False
+            hparams['domain_loss']['use_domain_projector'] = False
         elif hparams['cuda_visible_devices'] == [2]:
-            hparams['architecture']['domain_learning'] = True
-            hparams['architecture']['domain_token_dim'] = 8
-            hparams['pretrain']['load'] = False
+            hparams['architecture']['domain_learning'] = False
+            hparams['domain_loss']['use_domain_projector'] = False
         ####################################################################################
         ####################################################################################
         self.cfg = cfg
         self.hparams = hparams
         assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
         assert isinstance(self.hparams['exec_num'], int)
+        assert self.hparams['sttc'] in ['linear', 'mlp']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['pretrain']['load'] and not self.hparams['warmup']['load_model'] or not self.hparams['pretrain']['load'], 'cannot be warmup.load_model == True when pretrain.load is True'
         assert self.hparams['warmup']['load_model'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load_model'], "if load_model is True, use must be True"
@@ -87,7 +86,7 @@ class RMT(TTAMethod):
         # 自動的にレイヤ毎に最適なビット精度を選択してくれる（convはfp16, bnはfp32等）. ベストプラクティスを選択してくれるため、便利。use_amp=Falseではfp32を使用する。
         self.scaler = GradScaler(enabled=self.hparams['mixed_precision'])
                 
-        self.clip_model, self.tokens = set_clip_models(self.hparams, device, class_names)
+        self.clip_model, self.tokens, self.ctx = set_clip_models(self.hparams, device, class_names)
         if self.hparams['warmup']['use']:
             self.warmup_trainer = WarmUpTrainer(arch_name, ckpt_dir, ckpt_path, dataset_name, num_samples_warm_up)
             if self.hparams['warmup']['load_model']:
@@ -97,16 +96,19 @@ class RMT(TTAMethod):
         self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, device)
         self.optimizers = set_optimizers(hparams, self.models)
         self.self_trainer = SelfTrainer(hparams, self.clip_model, self.tokens, self.EMBEDDING_DIM, self.normal_transform, num_classes, dataset_name, device)
-        self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.tokens, self.models['mine'], self.EMBEDDING_DIM, self.clsdst_transform, self.src_loader.batch_size, device)
+        if self.hparams['architecture']['domain_learning']:
+            self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.tokens, self.models['mine'], self.EMBEDDING_DIM, self.clsdst_transform, self.src_loader.batch_size, device)
         self.final_lr = self.optimizers.param_groups[0]['lr']
 
     def learning(self, x):
         self.optimizers.zero_grad()
         self_train_loss, logits_st, logits_ema = self.self_trainer(x, self.models)
-        domain_loss = self.domain_trainer(x, self.models)
+        loss = self_train_loss
 
-        loss = self_train_loss + domain_loss
-
+        if self.hparams['architecture']['domain_learning']:
+            domain_loss = self.domain_trainer(x, self.models)
+            loss += domain_loss
+        
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizers)
         self.scaler.update()
@@ -143,7 +145,163 @@ class RMT(TTAMethod):
             logits = self.not_prompt_tuning_learning(x[0])
             return logits
 
+            
+class TextEncoder(nn.Module):
+    """ refer CoCoOp """
+    def __init__(self, hparams, clip_model, EMBEDDING_DIM, token_prefix, token_suffix):
+        super().__init__()
+        self.hparams = hparams
+        self.transformer = clip_model.transformer
+        self.positional_embedding = clip_model.positional_embedding
+        self.ln_final = clip_model.ln_final
+        self.text_projection = clip_model.text_projection
+        self.dtype = clip_model.dtype
+        self.EMBEDDING_DIM = EMBEDDING_DIM
+        self.token_prefix = token_prefix
+        self.token_suffix = token_suffix
 
+    def forward(self, fts, tokenized_prompts):
+        """
+            tokenized_prompts (L, 77)
+        """
+        # fts = fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
+
+        batch_size = fts.shape[0]
+        if self.token_prefix.shape[0] == 1:
+            token_prefix = self.token_prefix.repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
+            token_suffix = self.token_suffix.repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
+        else:
+            token_prefix = self.token_prefix
+            token_suffix = self.token_suffix
+
+        param_fts = torch.cat([token_prefix, fts, token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
+    
+        x = param_fts + self.positional_embedding.type(self.dtype)  # (L, 77, EMBEDDING_DIM)
+        x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
+        x = self.transformer(x)  # (77, L, EMBEDDING_DIM)
+        x = x.permute(1, 0, 2)  # (L, 77, EMBEDDING_DIM)
+        x = self.ln_final(x).type(self.dtype)  # (L, 77, EMBEDDING_DIM)
+        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # (L, EMBEDDING_DIM))
+
+        return x
+        
+
+class SelfTrainer(nn.Module):
+    def __init__(self, hparams, clip_model, tokens, EMBEDDING_DIM, normal_transform, num_classes, dataset_name, device):
+        super().__init__()
+        self.hparams = hparams
+        self.clip_model = clip_model
+        self.tokens = tokens
+        self.EMBEDDING_DIM = EMBEDDING_DIM
+        self.normal_transform = normal_transform
+        self.tta_transform = get_tta_transforms(dataset_name)
+        self.num_classes = num_classes
+        self.device = device
+        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, self.tokens['token_prefix'], self.tokens['token_suffix'])
+
+    def forward(self, x, models):
+        x_trans = self.normal_transform(x)  # (B, 3, 224, 224)
+        x_aug = self.tta_transform(x_trans)
+        image_fts = self.clip_model.encode_image(x_trans)  # (B, EMBEDDING_DIM)
+        image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
+        logits_st = self.get_logits(models['model_st'], image_fts)  # (B, num_classes)
+        logits_ema = self.get_logits(models['model_ema'], image_fts)  # (B, num_classes)
+        logits_aug = self.get_logits(models['model_st'], image_aug_fts)  # (B, num_classes)
+        
+        # Loss 式(6)
+        loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
+        # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
+        loss_trg = loss_entropy
+
+        return loss_trg, logits_st, logits_ema
+        
+    def get_logits(self, model, image_fts):
+        sttc_fts = model(image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        mean_sttc_fts = sttc_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
+        repeated_sttc_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
+
+        text_fts = self.text_encoder(repeated_sttc_fts, self.tokens['tokenized_prompts'])  # (num_classes, EMBEDDING_DIM)
+        norm_text_fts = F.normalize(text_fts)
+        norm_image_fts = F.normalize(image_fts)
+        logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
+        return logits
+
+
+class DomainTrainer(nn.Module):
+    def __init__(self, hparams, clip_model, tokens, mine, EMBEDDING_DIM, clsdst_transform, batch_size, device):
+        super().__init__()
+        assert hparams['domain_loss']['method'] in ['mine']
+        self.hparams = hparams
+        self.clip_model = clip_model
+        self.tokens = tokens
+        self.EMBEDDING_DIM = EMBEDDING_DIM
+        self.clsdst_transform = clsdst_transform
+        self.device = device
+        self.text_encoder = TextEncoder(hparams, clip_model, EMBEDDING_DIM, self.tokens['domain_token_prefix'], self.tokens['domain_token_suffix'])
+        
+        self.skp = skp.SinkhornKnopp()
+        n_clusters=(2, 2)
+        self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
+        if self.hparams['domain_loss']['method'] == 'mine':
+            self.mine_trainer = MineTrainer(mine)
+        elif self.hparams['domain_loss']['method'] == 'nt_xent':
+            self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
+
+    def forward(self, x, models):
+        x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
+        image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
+        st_clsdst_fts = models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+        if self.hparams['domain_loss']['use_domain_projector']:
+            domain_fts = models['domain_projector'](st_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            domain_text_fts = self.text_encoder(domain_fts, self.tokens['domain_tokenized_prompts'])  # (B, EMBEDDING_DIM)
+        else:
+            domain_text_fts = self.text_encoder(st_clsdst_fts, self.tokens['domain_tokenized_prompts'])  # (B, EMBEDDING_DIM)
+
+        image_clsdst_fts = F.normalize(image_clsdst_fts)
+        domain_text_fts = F.normalize(domain_text_fts)
+        
+        if self.hparams['domain_loss']['method'] == "nt_xent":
+            domain_loss = self.ntxent_criterion(image_clsdst_fts, domain_text_fts)
+        elif self.hparams['domain_loss']['method'] == 'mine':
+            # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う. そのため，バッチサイズは大きめでなくてはならない.
+            sim_mtx = F.cosine_similarity(
+                    x1=image_clsdst_fts.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
+                    x2=domain_text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
+                    dim=-1).detach().cpu().numpy()  # (B, B)
+
+            bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
+            clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
+
+            diag = torch.diag(clustered_mtx).long()
+            mean_feat_per_clust = [domain_text_fts[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
+
+            domain_loss = 0.
+            for i in range(len(mean_feat_per_clust)):
+                for j in range(i+1, len(mean_feat_per_clust)):
+                    data = torch.stack([mean_feat_per_clust[i], mean_feat_per_clust[j]], dim=1)
+                    mine_loss, _ = self.mine_trainer.get_loss(data)
+                    domain_loss += mine_loss
+
+        return domain_loss
+
+    def _get_bistochastic_mtx(self, sim_mtx):
+        """
+            sim_mtx: Similarity Matrix (Square Matrix) ([-1, 1])
+        """
+        sim_mtx = (sim_mtx + 1) / 2  # [-1, 1]の類似度行列を[0, 1]に変換.
+        bistochastic_mtx = self.skp.fit(sim_mtx)
+        
+        return bistochastic_mtx
+
+    def _biclustering(self, scaled_sim_mtx):
+        """
+            scaled_sim_mtx: 正規化した Similarity Matrix (Square Matrix) ([0, 1])
+        """
+        self.biclust_model.fit(scaled_sim_mtx)
+        clustered_mtx = torch.tensor(np.outer(self.biclust_model.row_labels_, self.biclust_model.column_labels_))
+
+        return clustered_mtx
+        
 class WarmUpTrainer(nn.Module):
     def __init__(self, arch_name, ckpt_dir, ckpt_path, dataset_name, num_samples_warm_up):
         super().__init__()
@@ -193,157 +351,7 @@ class WarmUpTrainer(nn.Module):
             for optim_name in self.optimizers.keys():
                 state_dicts[optim_name] = self.optimizers[optim_name].state_dict()
             torch.save(state_dicts, self.ckpt_path)
-
-
-class SelfTrainer(nn.Module):
-    def __init__(self, hparams, clip_model, tokens, EMBEDDING_DIM, normal_transform, num_classes, dataset_name, device):
-        super().__init__()
-        self.hparams = hparams
-        self.clip_model = clip_model
-        self.tokens = tokens
-        self.EMBEDDING_DIM = EMBEDDING_DIM
-        self.normal_transform = normal_transform
-        self.tta_transform = get_tta_transforms(dataset_name)
-        self.num_classes = num_classes
-        self.device = device
-
-    def forward(self, x, models):
-        x_trans = self.normal_transform(x)  # (B, 3, 224, 224)
-        x_aug = self.tta_transform(x_trans)
-        image_fts = self.clip_model.encode_image(x_trans)  # (B, EMBEDDING_DIM)
-        image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
-        logits_st = self.get_logits(models['model_st'], image_fts)  # (B, num_classes)
-        logits_ema = self.get_logits(models['model_ema'], image_fts)  # (B, num_classes)
-        logits_aug = self.get_logits(models['model_st'], image_aug_fts)  # (B, num_classes)
-        
-        # Loss 式(6)
-        loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)
-        # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
-        loss_trg = loss_entropy
-
-        return loss_trg, logits_st, logits_ema
-        
-    def get_logits(self, model, image_fts):
-        sttc_fts = model(image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        mean_sttc_fts = sttc_fts.mean(dim=0, keepdim=True)  # バッチ平均をとる. (1, EMBEDDING_DIM * num_domain_tokens)
-        repeated_sttc_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
-
-        text_fts = self._cat_text_features(repeated_sttc_fts)  # (num_classes, EMBEDDING_DIM)
-        norm_text_fts = F.normalize(text_fts)
-        norm_image_fts = F.normalize(image_fts)
-        logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
-        return logits
-
-    def _cat_text_features(self, sttc_fts):
-        sttc_fts = sttc_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
-        param_fts = torch.cat([self.tokens['token_prefix'], sttc_fts, self.tokens['token_suffix']], dim=1)  # (L, 77, EMBEDDING_DIM)
-
-        # refer CoOp: CoOP github. https://github.com/KaiyangZhou/CoOp/blob/b0a058869cef00a4e4ea5256d40fd7681119c099/trainers/coop.py#L46
-        # domain_featureに位置エンコーディングを加え，位置情報をembedding空間に反映する．
-        x = param_fts + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
-        x = self.clip_model.transformer(x)  # (77, L, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (L, 77, EMBEDDING_DIM)
-        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
-        
-        sttc_text_fts = x[torch.arange(x.shape[0]), self.tokens['tokenized_prompts'].argmax(dim=-1)] @ self.clip_model.text_projection  # (L, EMBEDDING_DIM))
-        return sttc_text_fts
-    
-
-
-class DomainTrainer(nn.Module):
-    def __init__(self, hparams, clip_model, tokens, mine, EMBEDDING_DIM, clsdst_transform, batch_size, device):
-        super().__init__()
-        assert hparams['domain_loss']['method'] in ['mine']
-        self.hparams = hparams
-        self.clip_model = clip_model
-        self.tokens = tokens
-        self.EMBEDDING_DIM = EMBEDDING_DIM
-        self.clsdst_transform = clsdst_transform
-        self.device = device
-        
-        self.skp = skp.SinkhornKnopp()
-        n_clusters=(2, 2)
-        self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
-        if self.hparams['domain_loss']['method'] == 'mine':
-            self.mine_trainer = MineTrainer(mine)
-        elif self.hparams['domain_loss']['method'] == 'nt_xent':
-            self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
-
-    def forward(self, x, models):
-        x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
-        image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
-        st_clsdst_fts = models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        ### TODO: Domain Projectorいらないかも．てか多分いらない．
-        domain_fts = models['domain_projector'](st_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        domain_text_fts = self._cat_text_features(domain_fts)  # (B, EMBEDDING_DIM)
-
-        image_clsdst_fts = F.normalize(image_clsdst_fts)
-        domain_text_fts = F.normalize(domain_text_fts)
-        
-        if self.hparams['domain_loss']['method'] == "nt_xent":
-            domain_loss = self.ntxent_criterion(image_clsdst_fts, domain_text_fts)
-        elif self.hparams['domain_loss']['method'] == 'mine':
-            # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う. そのため，バッチサイズは大きめでなくてはならない.
-            sim_mtx = F.cosine_similarity(
-                    x1=image_clsdst_fts.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
-                    x2=domain_text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
-                    dim=-1).detach().cpu().numpy()  # (B, B)
-
-            bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
-            clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
-
-            diag = torch.diag(clustered_mtx).long()
-            mean_feat_per_clust = [domain_text_fts[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
-
-            domain_loss = 0.
-            for i in range(len(mean_feat_per_clust)):
-                for j in range(i+1, len(mean_feat_per_clust)):
-                    data = torch.stack([mean_feat_per_clust[i], mean_feat_per_clust[j]], dim=1)
-                    mine_loss, _ = self.mine_trainer.get_loss(data)
-                    domain_loss += mine_loss
-
-        return domain_loss
-    
-
-    def _cat_text_features(self, domain_fts):
-        domain_fts = domain_fts.reshape(-1, self.hparams['num_domain_tokens'], self.EMBEDDING_DIM)  # (L, num_domain_tokens, EMBEDDING_DIM)
-
-        batch_size = domain_fts.shape[0]
-        rep_token_prefix = self.tokens['domain_token_prefix'].repeat_interleave(batch_size, dim=0)  # (L, 1, EMBEDDING_DIM)
-        rep_token_suffix = self.tokens['domain_token_suffix'].repeat_interleave(batch_size, dim=0)  # (L, 77-1-num_domain_tokens, EMBEDDING_DIM)
-        param_fts = torch.cat([rep_token_prefix, domain_fts, rep_token_suffix], dim=1)  # (L, 77, EMBEDDING_DIM)
-        tokenized_prompts = self.tokens['domain_tokenized_prompts']  # (L, 77)
-    
-        x = param_fts + self.clip_model.positional_embedding.type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
-        x = self.clip_model.transformer(x)  # (77, L, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (L, 77, EMBEDDING_DIM)
-        x = self.clip_model.ln_final(x).type(self.clip_model.dtype)  # (L, 77, EMBEDDING_DIM)
-        
-        domain_text_fts = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.clip_model.text_projection  # (L, EMBEDDING_DIM))
-        return domain_text_fts
-
-
-    def _get_bistochastic_mtx(self, sim_mtx):
-        """
-            sim_mtx: Similarity Matrix (Square Matrix) ([-1, 1])
-        """
-        sim_mtx = (sim_mtx + 1) / 2  # [-1, 1]の類似度行列を[0, 1]に変換.
-        bistochastic_mtx = self.skp.fit(sim_mtx)
-        
-        return bistochastic_mtx
-
-    def _biclustering(self, scaled_sim_mtx):
-        """
-            scaled_sim_mtx: 正規化した Similarity Matrix (Square Matrix) ([0, 1])
-        """
-        self.biclust_model.fit(scaled_sim_mtx)
-        clustered_mtx = torch.tensor(np.outer(self.biclust_model.row_labels_, self.biclust_model.column_labels_))
-
-        return clustered_mtx
-        
-        
+            
 
 @torch.jit.script
 def self_training_loss(x, x_aug, x_ema):# -> torch.Tensor:
@@ -362,37 +370,59 @@ def set_clip_models(hparams, device, class_names):
     clip_model, preprocess = clip.load(hparams['clip_backbone'], device=device)
     clip_model = clip_model.float()
 
-    # CLIPモデルのパラメータは更新させない
     logger.info('Set self.clip_model.parameters.reguires_grad = False!')
     for param in clip_model.parameters():
         param.requires_grad = False
 
     ##### Class Prompt用  refer DPLCLIP
-    prompt_prefix = ' '.join(['X'] * hparams['num_domain_tokens'])
-    
-    if hparams['sentence_prompt']:
-        logger.info('Using sentence_prompt in DPLCLIP...')
-        classnames = [f"a photo of a {name.replace('_', ' ')}" for name in class_names]
+    template = 'a photo of a'
+    n_ctx = hparams['num_domain_tokens']
+    ctx_dim = clip_model.ln_final.weight.shape[0]
+    ctx_init = template
+    if ctx_init:  ##### TODO: ランダムに初期化する方が良い？
+        ctx_init = ctx_init.replace(" {}.", "")
+        ctx_init = ctx_init.replace("_", " ")
+        prompt_n_ctx = len(ctx_init.split(" "))
+
+        assert n_ctx >= prompt_n_ctx, f"#tokens ({n_ctx}) should larger equal than #initial prompt tokens ({prompt_n_ctx}, {ctx_init})"
+
+        prompt = clip.tokenize(ctx_init).cuda()
+        with torch.no_grad():
+            embedding = clip_model.token_embedding(prompt).type(clip_model.dtype)
+
+        ctx_vectors = torch.zeros(n_ctx, ctx_dim, dtype=clip_model.dtype)
+
+        ctx_vectors[n_ctx - prompt_n_ctx:, :] = embedding[0, 1:1 + prompt_n_ctx, :]
+        prompt_prefix = " ".join(["X"] * (n_ctx - prompt_n_ctx))
+        prompt_prefix = f"{prompt_prefix} {ctx_init}"  # [X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, X, 'a', 'photo', 'of', 'a']
     else:
-        classnames = [name.replace('_', ' ') for name in class_names]
+        # random initialization
+        ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=clip_model.dtype)
+        nn.init.normal_(ctx_vectors, std=0.02)
+        prompt_prefix = " ".join(["X"] * n_ctx)
+
+    print(f'Initial context: "{prompt_prefix}"')
+    print(f"Number of context words (tokens): {n_ctx}")
+
+    ctx = nn.Parameter(ctx_vectors).cuda()
 
     ##### to get default token_prefix and token_suffix.
     tokens = {}
-    class_prompts = [prompt_prefix + ' ' + name + '.' for name in classnames]  # (クラス数)
+    class_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
     tokens['tokenized_prompts'] = torch.cat([clip.tokenize(p) for p in class_prompts]).to(device)  # (クラス数, 77)
     embedding = clip_model.token_embedding(tokens['tokenized_prompts']).type(clip_model.dtype)  # (クラス数 (入力文の数), 77 (各文のトークン数（シーケンス長）), self.EMBEDDING_DIM)
     tokens['token_prefix'] = embedding[:, :1, :]  # SOS (クラス数, 1, self.EMBEDDING_DIM)  各クラスの埋め込みトークンの最初の次元がSOS. SOS (Start of Sentence): SOSトークンは、文の開始を示すために使用されます。通常、モデルへの入力テキストの最初に追加されます。SOSトークンは、モデルに対して文の生成を開始するよう指示します。
-    tokens['token_suffix'] = embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (クラス数, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+    tokens['token_suffix'] = embedding[:, 1 + n_ctx:, :]  # CLS, EOS (クラス数, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
     
-    ##### Domain Prompt用  refer DPLCLIP
+    ##### Domain Prompt用
     if hparams['architecture']['domain_learning']:
-        domain_prompts = prompt_prefix + 'a photo of a '
+        domain_prompts = prompt_prefix
         tokens['domain_tokenized_prompts'] = clip.tokenize(domain_prompts).to(device)  # (1, 77)
         domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
-        tokens['domain_token_prefix'] = domain_embedding[:, :1:, :]  # SOS (1, 1, EMBEDDING_DIM)
-        tokens['domain_token_suffix'] = domain_embedding[:, hparams['num_domain_tokens'] + 1:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
+        tokens['domain_token_prefix'] = domain_embedding[:, :1, :]  # SOS (1, 1, EMBEDDING_DIM)
+        tokens['domain_token_suffix'] = domain_embedding[:, 1 + n_ctx:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
         
-    return clip_model, tokens
+    return clip_model, tokens, ctx
 
 
 def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
@@ -402,10 +432,10 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight)
             m.bias.data.fill_(0.01)
-    rtn_models['model_st'] = networks.MLP(EMBEDDING_DIM,
-                                EMBEDDING_DIM * hparams['num_domain_tokens'],
-                                hparams
-                                ).to(device=device, dtype=clip_model_dtype)
+    if hparams['sttc'] == 'linear':
+        rtn_models['model_st'] = nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'] ).to(device=device, dtype=clip_model_dtype)
+    elif hparams['sttc'] == 'mlp':
+        rtn_models['model_st'] = networks.MLP(EMBEDDING_DIM, EMBEDDING_DIM * hparams['num_domain_tokens'], hparams).to(device=device, dtype=clip_model_dtype)
     rtn_models['model_st'].apply(init_weights)
     rtn_models['model_ema'] = TTAMethod.copy_model(rtn_models['model_st'])
     for param in rtn_models['model_ema'].parameters():
@@ -413,9 +443,10 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
 
     ##### Domain Learning
     if hparams['architecture']['domain_learning']:
-        rtn_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM * hparams['num_domain_tokens'], EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
-    if hparams['domain_loss']['method'] == 'mine':
-        rtn_models['mine'] = Mine().to(device)
+        if hparams['domain_loss']['use_domain_projector']:
+            rtn_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM * hparams['num_domain_tokens'], EMBEDDING_DIM * hparams['num_domain_tokens'])).to(device=device, dtype=clip_model_dtype)
+        if hparams['domain_loss']['method'] == 'mine':
+            rtn_models['mine'] = Mine().to(device)
     
     return rtn_models
 

@@ -424,7 +424,9 @@ def set_hparams():
             "use": False,
             "load": False,
         },
+        'sttc': 'mlp',  # choice(['linear', 'mlp'])
         "domain_loss": {
+            "use_domain_projector": False,
             "method": "mine",  # choice(['nt_xent', 'mine']),  Domain学習をするか否かは architecture の部分で制御する.
             "nt_xent_temperature": 0.5,
         },
