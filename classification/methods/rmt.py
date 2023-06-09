@@ -142,10 +142,11 @@ class RMT(TTAMethod):
             ce_loss = self.warmup_criterion(logits_st, y)
             loss += ce_loss
         
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizers)
-        self.scaler.update()
-        self.update_ema_variables(self.m_teacher_momentum)
+        if self.hparams['architecture']['self_training'] or self.hparams['architecture']['domain_learning'] or warmup:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizers)
+            self.scaler.update()
+            self.update_ema_variables(self.m_teacher_momentum)
 
         return logits_st + logits_ema
     
