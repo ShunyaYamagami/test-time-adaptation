@@ -409,15 +409,15 @@ def set_hparams():
         "architecture": {
             'clip_only': False,
             'self_training': True,
-            'learnable_parameters': True,
-            'domain_learning': True,
+            'learnable_parameters': False,
+            'domain_learning': False,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "warmup": {
             "use": True,
             "load": True,
-            # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            'load_model_fname': None,
+            'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
+            # 'load_model_fname': None,
         },
         "prototypes": {
             "use": False,
