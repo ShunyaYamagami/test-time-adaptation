@@ -37,24 +37,18 @@ class RMT(TTAMethod):
         logger.info(f"----- RMT __init__ -----")
         ####################################################################################
         ####################################################################################
-        # if hparams['cuda_visible_devices'] == [0]:
-        #     hparams['architecture']['domain_learning'] = True
-        #     hparams['architecture']['learnable_parameters'] = False
-        #     hparams['domain_loss']['prompt'] = 'classname'
-        #     hparams['warmup']['use'] = True
-        #     hparams['warmup']['load'] = True
-        #     hparams['warmup']['load_model_fname'] = 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth'
-        #     hparams['prototypes']['use'] = False
-        #     hparams['prototypes']['load'] = False
-        # elif hparams['cuda_visible_devices'] == [2]:
-        #     hparams['architecture']['domain_learning'] = True
-        #     hparams['architecture']['learnable_parameters'] = False
-        #     hparams['domain_loss']['prompt'] = 'classname'
-        #     hparams['warmup']['use'] = True
-        #     hparams['warmup']['load'] = True
-        #     hparams['warmup']['load_model_fname'] = 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth'
-        #     hparams['prototypes']['use'] = True
-        #     hparams['prototypes']['load'] = True
+        if hparams['cuda_visible_devices'] == [0]:
+            hparams['architecture']['domain_learning'] = False
+            hparams['architecture']['learnable_parameters'] = False
+            hparams['warmup']['use'] = True
+            hparams['warmup']['load'] = False
+            hparams['domain_loss']['prompt'] = False
+        elif hparams['cuda_visible_devices'] == [2]:
+            hparams['architecture']['domain_learning'] = True
+            hparams['architecture']['learnable_parameters'] = False
+            hparams['warmup']['use'] = True
+            hparams['warmup']['load'] = False
+            hparams['domain_loss']['prompt'] = False
         ####################################################################################
         ####################################################################################
         self.cfg = cfg
@@ -86,6 +80,7 @@ class RMT(TTAMethod):
         num_classes = len(class_names)
         self.src_loader = src_loader
         self.src_loader_iter = iter(self.src_loader)
+        self.pretrained_dir = os.path.join(ckpt_dir, dataset_name.replace('_c', ''), 'pretrained')
         self.save_dir = save_dir
         self.m_teacher_momentum = m_teacher_momentum
         self.normal_transform, self.clsdst_transform = get_transform_when_iteration(grid=4)
@@ -125,13 +120,13 @@ class RMT(TTAMethod):
             self.warmup()
 
 
-    def learning(self, x, y=None, warmup=False):
+    def learning(self, x, y=None):
         self.optimizers.zero_grad()
         prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
         self_train_loss, logits_st, logits_ema = self.self_trainer(x, self.models, prompts, tokenized_prompts)
         loss = self_train_loss
 
-        if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
+        if self.hparams['architecture']['domain_learning']:
             domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
             domain_loss = self.domain_trainer(x, self.models, domain_prompts, domain_tokenized_prompts)
             # loss += domain_loss
@@ -139,8 +134,8 @@ class RMT(TTAMethod):
         
         if y is not None:
             ##### TODO: あれ，これ過学習起きるんじゃない？
-            ce_loss = self.warmup_criterion(logits_st, y)
-            loss += ce_loss
+            warmup_loss = self.warmup_criterion(logits_st, y)
+            loss += warmup_loss
         
         self.scaler.scale(loss).backward()
         self.scaler.step(self.optimizers)
@@ -157,22 +152,17 @@ class RMT(TTAMethod):
         """
         for ema_param, param in zip(self.models['model_ema'].parameters(), self.models['model_st'].parameters()):
             ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
+        # return self.models['model_ema']
     
     def warmup(self):
         if self.hparams['warmup']['load'] and os.path.exists(self.ckpt_path):
+            assert not self.hparams['pretrain']['load'], 'せっかくのpretrained-modelが上書きされてしまう.'
             logger.info(f"Loading warmup checkpoint... from {self.ckpt_path}")
-            if self.hparams['warmup']['load_model_fname'] is not None:
-                self.ckpt_path = os.path.join(Path(self.ckpt_path).parent, self.hparams['warmup']['load_model_fname'])
             checkpoint = torch.load(self.ckpt_path)
-            # for model_name in self.models.keys():
-            #     self.models[model_name].load_state_dict(checkpoint[model_name])
-            for model_name, cp in checkpoint.items():
-                if model_name != 'optimizer':
-                    self.models[model_name].load_state_dict(cp)
-                # else:
-                #     self.optimizers.load_state_dict(cp)
-                if model_name not in self.models.keys():
-                    logger.warning(f"----- model_name: {model_name} is not in self.models.keys(). -----")
+            for model_name in self.models.keys():
+                self.models[model_name].load_state_dict(checkpoint[model_name])
+            for optim_name in self.optimizers.keys():
+                self.optimizers[optim_name].load_state_dict(checkpoint[optim_name])
         else:
             os.makedirs(self.warmup_ckpt_path, exist_ok=True)
             logger.info(f"Starting warm up...{self.warmup_steps} steps")
@@ -186,7 +176,7 @@ class RMT(TTAMethod):
                     src_batch = next(self.src_loader_iter)
                 x = src_batch[0].to(self.device)
                 y = src_batch[1].to(self.device)
-                logits = self.learning(x, y, warmup=True)
+                logits = self.learning(x, y)
                 if i % 50 == 0 or i == self.warmup_steps-1:
                     acc = logits.argmax(dim=1).eq(y).sum().item() / y.size(0)
                     logger.info(f"step: {i}\tacc: {acc*100:.2f}%")
@@ -200,12 +190,11 @@ class RMT(TTAMethod):
                 state_dicts['optimizer'] = self.optimizers.state_dict()
                 torch.save(state_dicts, self.ckpt_path)
 
-    def clip_only_learning(self, x):
+    def not_prompt_tuning_learning(self, x):
         x_cls = self.normal_transform(x)  # (B, 3, 224, 224)
         with torch.no_grad():
-            tokenized_prompts = self.prompt_learner.tokens['tokenized_prompts']
             image_fts = self.clip_model.encode_image(x_cls)  # (B, EMBEDDING_DIM)
-            text_fts = self.clip_model.encode_text(tokenized_prompts)
+            text_fts = self.clip_model.encode_text(self.tokens['tokenized_prompts'])
         norm_image_fts = F.normalize(image_fts)
         norm_text_fts = F.normalize(text_fts)
         logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
@@ -213,12 +202,12 @@ class RMT(TTAMethod):
 
     @torch.enable_grad()  # ensure grads in possible no grad context for testing
     def forward_and_adapt(self, x):
-        if self.hparams['architecture']['clip_only']:
-            logits = self.clip_only_learning(x[0])
-            return logits
-        else:
+        if self.hparams['architecture']['prompt_tuning']:
             ensembled_logits = self.learning(x[0])
             return ensembled_logits
+        else:
+            logits = self.not_prompt_tuning_learning(x[0])
+            return logits
 
             
 class TextEncoder(nn.Module):
@@ -317,17 +306,27 @@ class DomainTrainer(nn.Module):
 
         if self.hparams['prototypes']['use']:
             indices = torch.randperm(image_clsdst_fts.nelement())[:image_clsdst_fts.shape[0]]
-            sampled_prototypes = self.prototypes_src[indices].squeeze(1).cuda()
+            sampled_prototypes = self.prototypes_src[indices].cuda()
             image_clsdst_fts = torch.cat([image_clsdst_fts, sampled_prototypes], dim=0)
-            if self.hparams['domain_loss']['prompt'] == 'classname':
-                # 正方行列にするためにpaddingを追加.
-                text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
-                text_fts = torch.cat([text_fts, text_padding], dim=0)
-            else:
-                pass
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            # print("\t複製して無理やり正方行列にしているよ. non-suareのsinkhorn-knoppどうすれば良いの？")
+            # text_fts = text_fts.repeat_interleave(2, dim=0)
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+            ###########################################################
+        
         if self.hparams['domain_loss']['method'] == "nt_xent":
             domain_loss = self.ntxent_criterion(image_clsdst_fts, text_fts)
         elif self.hparams['domain_loss']['method'] == 'mine':
+            # 流石にデータセット単位で類似度計算を行うと，10,000*10,000の計算量となるので，バッチごとに行う. そのため，バッチサイズは大きめでなくてはならない.
             sim_mtx = F.cosine_similarity(
                     x1=image_clsdst_fts.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
                     x2=text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
@@ -429,7 +428,7 @@ class PromptLearner(nn.Module):
         n_ctx = hparams['num_domain_tokens']
         ctx_dim = clip_model.ln_final.weight.shape[0]
         ctx_init = template
-        if hparams['architecture']['learnable_parameters'] and not hparams['architecture']['clip_only']:
+        if hparams['architecture']['learnable_parameters']:
             if ctx_init:  ##### TODO: ランダムに初期化する方が良い？
                 ctx_init = ctx_init.replace(" {}.", "")
                 ctx_init = ctx_init.replace("_", " ")
@@ -519,19 +518,13 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
     for param in rtn_models['model_ema'].parameters():
         param.detach_()
 
-    if not hparams['architecture']['self_training']:
-        not_requires_grad = ['model_st', 'model_ema']
-        for nrg in not_requires_grad:
-            for param in rtn_models[nrg].parameters():
-                param.requires_grad = False
-
     ##### Domain Learning
     if hparams['architecture']['domain_learning']:
         if hparams['domain_loss']['use_domain_projector']:
             rtn_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM)).to(device=device, dtype=clip_model_dtype)
         if hparams['domain_loss']['method'] == 'mine':
             rtn_models['mine'] = Mine().to(device)
-        
+    
     return rtn_models
 
 
