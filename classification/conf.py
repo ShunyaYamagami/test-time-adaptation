@@ -164,11 +164,18 @@ _C.GTTA.USE_STYLE_TRANSFER = False
 _C.RMT = CfgNode()
 
 # _C.RMT.LAMBDA_CE_SRC = 1.0
-_C.RMT.LAMBDA_CE_SRC = 0.  ####################################################
+_C.RMT.LAMBDA_CE_SRC = 0.
 _C.RMT.LAMBDA_CE_TRG = 1.0
 _C.RMT.LAMBDA_CONT = 1.0
-_C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+########################################################################################################
+########################################################################################################
+########################################################################################################
+# _C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+_C.RMT.NUM_SAMPLES_WARM_UP = 400000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+########################################################################################################
+########################################################################################################
+########################################################################################################
 
 # --------------------------------- AdaContrast options --------------------- #
 _C.ADACONTRAST = CfgNode()
@@ -409,13 +416,15 @@ def set_hparams():
         "architecture": {
             'clip_only': False,
             'self_training': True,
-            'learnable_parameters': False,
+            'sttc_backward': False,
+            'self_training_use_aug': True,
+            'learnable_parameters': True,
             'domain_learning': False,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "warmup": {
             "use": True,
-            "load": True,
+            "load": False,
             'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
             # 'load_model_fname': None,
         },
