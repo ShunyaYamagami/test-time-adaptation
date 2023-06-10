@@ -424,9 +424,9 @@ def set_hparams():
         }, # 下でupdate
         "warmup": {
             "use": True,
-            "load": False,
-            'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            # 'load_model_fname': None,
+            "load": True,
+            # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
+            'load_model_fname': None,
         },
         "prototypes": {
             "use": False,
