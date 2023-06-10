@@ -4,6 +4,7 @@ import os
 import numpy as np
 import tqdm
 import yaml
+from time import time, sleep
 import torch
 import torch.nn as nn
 import torch.jit
@@ -118,3 +119,14 @@ class PrototypeRunner(nn.Module):
         torch.save(features_src, self.fname)
         features_src = features_src.to(self.device).unsqueeze(1) 
         return features_src
+
+
+def decorator_timer(some_function):
+    """ 時間計測用のデコレータ """
+    def wrapper(*args, **kwargs):
+        t1 = time()
+        result = some_function(*args, **kwargs)
+        end = time()-t1
+        print(f'\t{end:.2f}s')
+        return result
+    return wrapper
