@@ -129,9 +129,6 @@ class RMT(TTAMethod):
             self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
             loss += self_train_loss
             logits = logits_st + logits_ema  # Ensembled Logits
-        else:
-            norm_image_fts = F.normalize(image_fts)
-            logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
 
         ### Domain Learning
         if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
@@ -154,6 +151,8 @@ class RMT(TTAMethod):
             if self.hparams['architecture']['self_training']:
                 ce_loss = self.warmup_criterion(logits_st, y)
             else:
+                norm_image_fts = F.normalize(image_fts)
+                logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
                 ce_loss = self.warmup_criterion(logits, y)
             loss += ce_loss
         
