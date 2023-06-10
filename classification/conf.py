@@ -416,7 +416,7 @@ def set_hparams():
         "architecture": {
             'clip_only': False,
             'self_training': True,
-            'sttc_backward': False,
+            'sttc_backward': False,  # warmupだけの場合に使う.
             'self_training_use_aug': True,
             'learnable_parameters': True,
             'domain_learning': False,

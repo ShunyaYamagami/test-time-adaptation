@@ -95,7 +95,7 @@ class RMT(TTAMethod):
                 self.prototypes_src = prototype_runner()
             
         self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, dataset_name)
-        self.text_encoder = TextEncoder(hparams, self.clip_model, self.EMBEDDING_DIM, num_classes)
+        self.text_encoder = TextEncoder(hparams, self.clip_model)
 
         assert self.hparams['architecture']['sttc_backward'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['sttc_backward']
         assert self.hparams['architecture']['self_training_use_aug'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['self_training_use_aug']
@@ -247,7 +247,7 @@ class ImageEncoder(nn.Module):
 
 class TextEncoder(nn.Module):
     """ refer CoCoOp """
-    def __init__(self, hparams, clip_model:CLIP, EMBEDDING_DIM, num_classes):
+    def __init__(self, hparams, clip_model:CLIP):
         super().__init__()
         self.hparams = hparams
         self.transformer = clip_model.transformer
@@ -255,8 +255,6 @@ class TextEncoder(nn.Module):
         self.ln_final = clip_model.ln_final
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
-        self.EMBEDDING_DIM = EMBEDDING_DIM
-        self.num_classes = num_classes
 
     def forward(self, prompt, tokenized_prompts):
         x = prompt + self.positional_embedding.type(self.dtype)  # (L, 77, EMBEDDING_DIM)
