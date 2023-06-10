@@ -27,7 +27,7 @@ from augmentations.aug import get_transform_when_iteration
 from models.model import get_model, split_up_model
 from models.mine import Mine, MineTrainer
 from loss.nt_xent import NTXentLoss
-
+from methods.my_modules import ImageEncoder, TextEncoder, PrototypeRunner
 logger = logging.getLogger(__name__)
 
 
@@ -94,7 +94,7 @@ class RMT(TTAMethod):
             else:
                 self.prototypes_src = prototype_runner()
             
-        self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, dataset_name)
+        self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, self.clsdst_transform, dataset_name)
         self.text_encoder = TextEncoder(hparams, self.clip_model)
 
         assert self.hparams['architecture']['sttc_backward'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['sttc_backward']
@@ -117,42 +117,57 @@ class RMT(TTAMethod):
 
     def learning(self, x, y=None, warmup=False):
         self.optimizers.zero_grad()
+        loss = 0.
         # text
         prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
         text_fts = self.text_encoder(prompts, tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
         norm_text_fts = F.normalize(text_fts)
-
         # image
-        image_fts, image_aug_fts = self.image_encoder(x)
-        # Self Training
-        self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
-        loss = self_train_loss
+        image_fts, image_aug_fts = self.image_encoder(x, class_domain='class')
+        if self.hparams['architecture']['self_training']:
+            ### Self Training
+            self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
+            loss += self_train_loss
+            logits = logits_st + logits_ema  # Ensembled Logits
+        else:
+            norm_image_fts = F.normalize(image_fts)
+            logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
 
-        # Domain Learning
+        ### Domain Learning
         if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
+            # text
             domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
             domain_text_fts = self.text_encoder(domain_prompts, domain_tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
             norm_domain_text_fts = F.normalize(domain_text_fts)
-            domain_loss = self.domain_trainer(x, self.models, norm_domain_text_fts)
+            # image
+            image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
+            if self.hparams['architecture']['self_training']:
+                image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            # Domain Training
+            domain_loss = self.domain_trainer(image_clsdst_fts, norm_domain_text_fts)
             # loss += domain_loss
             loss -= domain_loss
         
-        # Cross Entropy Loss with Ground Truth
+        ### Cross Entropy Loss with Ground Truth
         if y is not None:
             ##### TODO: あれ，これ過学習起きるんじゃない？
-            ce_loss = self.warmup_criterion(logits_st, y)
+            if self.hparams['architecture']['self_training']:
+                ce_loss = self.warmup_criterion(logits_st, y)
+            else:
+                ce_loss = self.warmup_criterion(logits, y)
             loss += ce_loss
         
-        if self.hparams['architecture']['sttc_backward'] \
+        if (self.hparams['architecture']['self_training'] and self.hparams['architecture']['sttc_backward']) \
             or self.hparams['architecture']['domain_learning'] \
             or self.hparams['architecture']['learnable_parameters'] \
             or warmup:
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizers)
             self.scaler.update()
-            self.update_ema_variables(self.m_teacher_momentum)
+            if self.hparams['architecture']['self_training']:
+                self.update_ema_variables(self.m_teacher_momentum)
 
-        return logits_st + logits_ema
+        return logits
     
     def update_ema_variables(self, alpha_teacher):
         """ Studentにした変更を, EMA(Exponential Moving Average) によりTeacherモデルへ反映する. 
@@ -222,49 +237,6 @@ class RMT(TTAMethod):
         else:
             ensembled_logits = self.learning(x[0])
             return ensembled_logits
-
-            
-class ImageEncoder(nn.Module):
-    def __init__(self, hparams, clip_model:CLIP, normal_transform, dataset_name):
-        super().__init__()
-        self.hparams = hparams
-        self.clip_model = clip_model
-        self.normal_transform = normal_transform
-        self.tta_transform = get_tta_transforms(dataset_name)
-        
-    def forward(self, x):
-        x_trans = self.normal_transform(x)  # (B, 3, 224, 224)
-        with torch.no_grad():
-            image_fts = self.clip_model.encode_image(x_trans)  # (B, EMBEDDING_DIM)
-
-        if self.hparams['architecture']['self_training_use_aug']:
-            x_aug = self.tta_transform(x_trans)
-            with torch.no_grad():
-                image_aug_fts = self.clip_model.encode_image(x_aug)  # (B, EMBEDDING_DIM)
-            return image_fts, image_aug_fts
-        else:
-            return image_fts, None
-
-class TextEncoder(nn.Module):
-    """ refer CoCoOp """
-    def __init__(self, hparams, clip_model:CLIP):
-        super().__init__()
-        self.hparams = hparams
-        self.transformer = clip_model.transformer
-        self.positional_embedding = clip_model.positional_embedding
-        self.ln_final = clip_model.ln_final
-        self.text_projection = clip_model.text_projection
-        self.dtype = clip_model.dtype
-
-    def forward(self, prompt, tokenized_prompts):
-        x = prompt + self.positional_embedding.type(self.dtype)  # (L, 77, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (77, L, EMBEDDING_DIM)
-        x = self.transformer(x)  # (77, L, EMBEDDING_DIM)
-        x = x.permute(1, 0, 2)  # (L, 77, EMBEDDING_DIM)
-        x = self.ln_final(x).type(self.dtype)  # (L, 77, EMBEDDING_DIM)
-        x = x[torch.arange(x.shape[0]), tokenized_prompts.argmax(dim=-1)] @ self.text_projection  # (L, EMBEDDING_DIM))
-
-        return x
         
 
 class SelfTrainer(nn.Module):
@@ -314,14 +286,9 @@ class DomainTrainer(nn.Module):
         elif self.hparams['domain_loss']['method'] == 'nt_xent':
             self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
 
-    def forward(self, x, models, text_fts):
-        x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
-        with torch.no_grad():
-            image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
-        st_clsdst_fts = models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-
-        mean_sttc_fts = st_clsdst_fts.mean(dim=0, keepdim=True)
-        image_clsdst_fts = mean_sttc_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
+    def forward(self, image_clsdst_fts, text_fts):
+        image_clsdst_fts = image_clsdst_fts.mean(dim=0, keepdim=True)
+        image_clsdst_fts = image_clsdst_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
         image_clsdst_fts = F.normalize(image_clsdst_fts)
 
         if self.hparams['prototypes']['use']:
@@ -374,58 +341,6 @@ class DomainTrainer(nn.Module):
         clustered_mtx = torch.tensor(np.outer(self.biclust_model.row_labels_, self.biclust_model.column_labels_))
 
         return clustered_mtx
-        
-
-        
-class PrototypeRunner(nn.Module):
-    def __init__(self, hparams, clip_model:CLIP, src_loader, normal_transform, clsdst_transform, num_classes, arch_name, ckpt_dir, ckpt_path, dataset_name, device):
-        super().__init__()
-        self.clip_model = clip_model
-        self.src_loader = src_loader
-        self.clsdst_transform = clsdst_transform
-        self.num_classes = num_classes
-        self.device = device
-        self.proto_dir_path = os.path.join(ckpt_dir, "prototypes")
-        if dataset_name == "domainnet126":
-            fname = f"protos_{dataset_name}_{ckpt_path.split(os.sep)[-1].split('_')[1]}.pth"
-        else:
-            fname = f"protos_{dataset_name}_{arch_name}.pth"
-        self.fname = os.path.join(self.proto_dir_path, fname)
-
-    def load(self):
-        assert os.path.exists(self.fname)
-        logger.info(f"Loading class-wise source prototypes from {self.fname}...")
-        prototypes_src = torch.load(self.fname)
-        return prototypes_src
-
-    def forward(self):
-        os.makedirs(self.proto_dir_path, exist_ok=True)
-        features_src = torch.tensor([])
-        logger.info("Extracting source prototypes...")
-        with torch.no_grad():
-            for data in tqdm.tqdm(self.src_loader):
-                if len(features_src) > 10000:
-                    break
-                x = data[0].cuda()
-                x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
-                image_clsdst_fts = self.clip_model.encode_image(x_clsdst)  # (B, EMBEDDING_DIM)
-                image_clsdst_fts = F.normalize(image_clsdst_fts)
-                features_src = torch.cat([features_src, image_clsdst_fts.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
-
-        torch.save(features_src, self.fname)
-        features_src = features_src.to(self.device).unsqueeze(1) 
-        return features_src
-
-
-@torch.jit.script
-def self_training_loss(x, x_aug, x_ema):# -> torch.Tensor:
-    """ 式(6) """
-    return - 0.25 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.25 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1) \
-           - 0.25 * (x_ema.softmax(1) * x_aug.log_softmax(1)).sum(1) - 0.25 * (x_aug.softmax(1) * x_ema.log_softmax(1)).sum(1)
-
-@torch.jit.script
-def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
-    return -0.5 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.5 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1)
 
 
 class PromptLearner(nn.Module):
@@ -508,7 +423,17 @@ class PromptLearner(nn.Module):
         prompts = torch.cat([prefix, ctx, suffix], dim=1)
         
         return prompts, tokenized_prompts
-            
+    
+
+@torch.jit.script
+def self_training_loss(x, x_aug, x_ema):# -> torch.Tensor:
+    """ 式(6) """
+    return - 0.25 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.25 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1) \
+           - 0.25 * (x_ema.softmax(1) * x_aug.log_softmax(1)).sum(1) - 0.25 * (x_aug.softmax(1) * x_ema.log_softmax(1)).sum(1)
+
+@torch.jit.script
+def symmetric_cross_entropy(x, x_ema):# -> torch.Tensor:
+    return -0.5 * (x_ema.softmax(1) * x.log_softmax(1)).sum(1) - 0.5 * (x.softmax(1) * x_ema.log_softmax(1)).sum(1)
 
 
 def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
@@ -518,18 +443,19 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
         if isinstance(m, nn.Linear):
             torch.nn.init.xavier_uniform_(m.weight)
             m.bias.data.fill_(0.01)
-    if hparams['sttc'] == 'linear':
-        rtn_models['model_st'] = nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM ).to(device=device, dtype=clip_model_dtype)
-    elif hparams['sttc'] == 'mlp':
-        rtn_models['model_st'] = networks.MLP(EMBEDDING_DIM, EMBEDDING_DIM, hparams).to(device=device, dtype=clip_model_dtype)
-    rtn_models['model_st'].apply(init_weights)
-    rtn_models['model_ema'] = TTAMethod.copy_model(rtn_models['model_st'])
-    for param in rtn_models['model_ema'].parameters():
-        param.detach_()
+    if hparams['architecture']['self_training']:
+        if hparams['sttc'] == 'linear':
+            rtn_models['model_st'] = nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM ).to(device=device, dtype=clip_model_dtype)
+        elif hparams['sttc'] == 'mlp':
+            rtn_models['model_st'] = networks.MLP(EMBEDDING_DIM, EMBEDDING_DIM, hparams).to(device=device, dtype=clip_model_dtype)
+        rtn_models['model_st'].apply(init_weights)
+        rtn_models['model_ema'] = TTAMethod.copy_model(rtn_models['model_st'])
+        for param in rtn_models['model_ema'].parameters():
+            param.detach_()
 
-    if not hparams['architecture']['sttc_backward']:
-        for param in rtn_models['model_st'].parameters():
-            param.requires_grad = False
+        if not hparams['architecture']['sttc_backward']:
+            for param in rtn_models['model_st'].parameters():
+                param.requires_grad = False
 
     ##### Domain Learning
     if hparams['architecture']['domain_learning']:
@@ -553,13 +479,3 @@ def set_optimizers(hparams, models):
         optimizers = torch.optim.SGD(class_args_params, lr=hparams['lr'], momentum=hparams['momentum'])
 
     return optimizers
-
-
-def to_numpy_array(lst):
-    np_array = []
-    for item in lst:
-        if isinstance(item, torch.Tensor):
-            np_array.append(item.cpu().detach().numpy())
-        elif isinstance(item, list):
-            np_array.append(to_numpy_array(item))
-    return np.array(np_array)

@@ -415,9 +415,9 @@ def set_hparams():
             # これをTrueにすることはもうないだろう.
         "architecture": {
             'clip_only': False,
-            'self_training': True,
+            'self_training': False,
             'sttc_backward': False,  # warmupだけの場合に使う.
-            'self_training_use_aug': True,
+            'self_training_use_aug': False,
             'learnable_parameters': True,
             'domain_learning': False,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
