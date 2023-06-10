@@ -1,3 +1,4 @@
+# https://github.com/sungyubkim/MINE-Mutual-Information-Neural-Estimation-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -21,7 +22,6 @@ class Mine(nn.Module):
     def forward(self, input):
         output = self.model(input)
         return output
-
 
 
 class MineTrainer():
@@ -71,17 +71,16 @@ class MineTrainer():
         return loss, mi_lb
 
 
-    # def train(self, data, iter_num=int(5e+3), log_freq=int(1e+3)):
-    #     result = []
-    #     for i in range(iter_num):
-    #         self.mine_optim.zero_grad()
-    #         loss, mi_lb = self.get_loss(data)
-    #         loss.backward()
-    #         self.mine_optim.step()
+    def train(self, data, iter_num=int(5e+3)):
+        optimizer = torch.optim.Adam(self.mine.parameters(), lr=1e-3)
 
-    #         result.append(mi_lb.detach().cpu().numpy())
+        result = []
+        for i in range(iter_num):
+            optimizer.zero_grad()
+            loss, mi_lb = self.get_loss(data)
+            loss.backward()
+            optimizer.step()
 
-    #         # if (i + 1) % (log_freq) == 0:
-    #         #     print(result[-1])
-    #     return result
+        #     result.append(mi_lb.detach().cpu().numpy())
+        # return result
 

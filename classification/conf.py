@@ -430,7 +430,7 @@ def set_hparams():
         },
         "prototypes": {
             "use": True,
-            "load": False,
+            "load": True,
         },
         'sttc': 'mlp',  # choice(['linear', 'mlp'])
         "domain_loss": {

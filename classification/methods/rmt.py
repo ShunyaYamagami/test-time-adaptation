@@ -90,7 +90,8 @@ class RMT(TTAMethod):
         self.prompt_learner = PromptLearner(hparams, self.clip_model, class_names, num_classes, self.device)
         if self.hparams['architecture']['learnable_parameters']:
             self.models['prompt_learner'] = self.prompt_learner
-        self.optimizers = set_optimizers(hparams, self.models)
+        if not self.hparams['architecture']['clip_only']:
+            self.optimizers = set_optimizers(hparams, self.models)
         
         self.prototypes_src = None
         if self.hparams['prototypes']['use']:
