@@ -38,11 +38,11 @@ class RMT(TTAMethod):
         ####################################################################################
         ####################################################################################
         if hparams['cuda_visible_devices'] == [0]:
-            hparams['architecture']['domain_learning'] = False
+            hparams['architecture']['domain_learning'] = True
             hparams['warmup']['use'] = True
             hparams['warmup']['load'] = True
         if hparams['cuda_visible_devices'] == [2]:
-            hparams['architecture']['domain_learning'] = False
+            hparams['architecture']['domain_learning'] = True
             hparams['warmup']['use'] = True
             hparams['warmup']['load'] = True
         ####################################################################################
@@ -122,8 +122,9 @@ class RMT(TTAMethod):
 
 
     def learning(self, x, y=None, warmup=False):
+        assert (y is not None and warmup) or (y is None)
         self.optimizers.zero_grad()
-        loss = 0.
+        loss = torch.tensor(0.0, requires_grad=True).cuda()
         # text
         prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
         text_fts = self.text_encoder(prompts, tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
@@ -156,7 +157,7 @@ class RMT(TTAMethod):
             loss -= domain_loss
         
         ### Cross Entropy Loss with Ground Truth
-        if y is not None:
+        if warmup:
             ##### TODO: あれ，これ過学習起きるんじゃない？
             if self.hparams['architecture']['self_training']:
                 ce_loss = self.warmup_criterion(logits_st, y)
@@ -164,9 +165,10 @@ class RMT(TTAMethod):
                 ce_loss = self.warmup_criterion(logits, y)
             loss += ce_loss
         
+        if loss == 0.0:
+            logger.warning('[Warning]: loss is 0.0.')
         if (self.hparams['architecture']['self_training'] and self.hparams['architecture']['sttc_backward']) \
-            or self.hparams['architecture']['domain_learning'] \
-            or self.hparams['architecture']['learnable_parameters'] \
+            or (self.hparams['architecture']['domain_learning'] and not warmup) \
             or warmup:
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizers)
@@ -286,8 +288,7 @@ class DomainTrainer(nn.Module):
         self.device = device
         
         self.skp = skp.SinkhornKnopp()
-        n_clusters=(2, 2)
-        self.biclust_model = SpectralBiclustering(n_clusters=n_clusters, method="log", random_state=0)
+        self.biclust_model = SpectralBiclustering(n_clusters=hparams['domain_loss']['n_clusters'], method="log", random_state=0)
         if self.hparams['domain_loss']['method'] == 'mine':
             self.mine_trainer = MineTrainer(mine)
         elif self.hparams['domain_loss']['method'] == 'nt_xent':
@@ -303,11 +304,12 @@ class DomainTrainer(nn.Module):
             sampled_prototypes = self.prototypes_src[indices].squeeze(1).cuda()
             image_clsdst_fts = torch.cat([image_clsdst_fts, sampled_prototypes], dim=0)
             if self.hparams['domain_loss']['prompt'] == 'classname':
-                # 正方行列にするためにpaddingを追加.
-                text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
-                text_fts = torch.cat([text_fts, text_padding], dim=0)
-            else:
-                pass
+                if self.hparams['domain_loss']['to_square'] == 'padding':
+                    # 正方行列にするためにpaddingを追加.
+                    text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
+                    text_fts = torch.cat([text_fts, text_padding], dim=0)
+                elif self.hparams['domain_loss']['to_square'] == 'duplicate':
+                    text_fts = text_fts.repeat_interleave(2, dim=0)
         if self.hparams['domain_loss']['method'] == "nt_xent":
             domain_loss = self.ntxent_criterion(image_clsdst_fts, text_fts)
         elif self.hparams['domain_loss']['method'] == 'mine':
@@ -321,8 +323,10 @@ class DomainTrainer(nn.Module):
 
             diag = torch.diag(clustered_mtx).long()
             mean_feat_per_clust = [text_fts[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
+            if len(mean_feat_per_clust) == 1:
+                logger.warning('[Warning] The Number of Clusters is 1')
 
-            domain_loss = 0.
+            domain_loss = torch.tensor(0.0, requires_grad=True).cuda()
             for i in range(len(mean_feat_per_clust)):
                 for j in range(i+1, len(mean_feat_per_clust)):
                     data = torch.stack([mean_feat_per_clust[i], mean_feat_per_clust[j]], dim=1)

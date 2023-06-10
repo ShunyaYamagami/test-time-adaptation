@@ -429,14 +429,16 @@ def set_hparams():
             'load_model_fname': None,
         },
         "prototypes": {
-            "use": False,
+            "use": True,
             "load": False,
         },
         'sttc': 'mlp',  # choice(['linear', 'mlp'])
         "domain_loss": {
             "use_domain_projector": False,
-            "prompt": 'classname',  # choice([False, 'classname'])
+            'n_clusters': (4, 4),
             "method": "mine",  # choice(['nt_xent', 'mine']),  Domain学習をするか否かは architecture の部分で制御する.
+            "prompt": 'classname',  # choice([False, 'classname'])
+            'to_square': 'duplicate',  # choice(['padding', 'duplicate'])
             "nt_xent_temperature": 0.5,
         },
         "cuda_visible_devices": list(map(int, os.environ.get('CUDA_VISIBLE_DEVICES').split(","))),
