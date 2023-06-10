@@ -170,8 +170,8 @@ _C.RMT.LAMBDA_CONT = 1.0
 ########################################################################################################
 ########################################################################################################
 ########################################################################################################
-# _C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
-_C.RMT.NUM_SAMPLES_WARM_UP = 400000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+_C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+# _C.RMT.NUM_SAMPLES_WARM_UP = 400000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 ########################################################################################################
 ########################################################################################################
@@ -396,6 +396,7 @@ def get_domain_sequence(ckpt_path):
 def set_hparams():
     hparams = EasyDict({
         "clip_backbone": 'ViT-B/32',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
+        # "clip_backbone": 'ViT-B/16',  # choice(['ViT-B/32', 'ViT-B/16', 'RN101']),
         "num_domain_tokens": 16,
         "sentence_prompt": True, ####### 独自に追加.
         # "optimizer": "SGD", ####### 独自に追加.
@@ -415,18 +416,18 @@ def set_hparams():
             # これをTrueにすることはもうないだろう.
         "architecture": {
             'clip_only': False,
-            'self_training': False,
-            'sttc_backward': False,  # warmupだけの場合に使う.
+            'self_training': True,
+            'sttc_backward': True,  # warmupだけの場合に使う.
             'self_training_use_aug': False,
-            'learnable_parameters': True,
+            'learnable_parameters': False,
             'domain_learning': True,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "warmup": {
             "use": True,
             "load": True,
-            # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            'load_model_fname': None,
+            'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
+            # 'load_model_fname': None,
         },
         "prototypes": {
             "use": True,
@@ -438,6 +439,7 @@ def set_hparams():
             'n_clusters': (4, 4),
             "method": "mine",  # choice(['nt_xent', 'mine']),  Domain学習をするか否かは architecture の部分で制御する.
             "prompt": 'classname',  # choice([False, 'classname'])
+            "clustering_method": 'SpectralCoclustering',  # choice(['SpectralBiclustering', 'SpectralCoclustering'])
             'to_square': 'duplicate',  # choice(['padding', 'duplicate'])
             "nt_xent_temperature": 0.5,
         },

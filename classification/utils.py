@@ -2,6 +2,7 @@ import torch
 import logging
 import numpy as np
 from datasets.imagenet_subsets import IMAGENET_D_MAPPING
+import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ def get_accuracy(model: torch.nn.Module,
 
     correct = 0.
     with torch.no_grad():
-        for i, data in enumerate(data_loader):
+        for i, data in tqdm.tqdm(enumerate(data_loader)):
             imgs, labels = data[0], data[1]
             # methods/base.py forward() -> rmt.py 
             output = model([img.to(device) for img in imgs]) if isinstance(imgs, list) else model(imgs.to(device))

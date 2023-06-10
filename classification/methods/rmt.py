@@ -15,9 +15,11 @@ from torchsummary import summary
 import clip
 from clip.model import CLIP
 from sinkhorn_knopp import sinkhorn_knopp as skp
-from sklearn.cluster import SpectralBiclustering
+# https://scikit-learn.org/stable/auto_examples/bicluster/plot_spectral_coclustering.html#sphx-glr-auto-examples-bicluster-plot-spectral-coclustering-py
+from sklearn.cluster import SpectralBiclustering, SpectralCoclustering
 from pathlib import Path
 from functools import partial
+from matplotlib import pyplot as plt
 
 from conf import get_num_classes
 from domainbed import networks
@@ -37,14 +39,14 @@ class RMT(TTAMethod):
         super().__init__(steps, episodic, window_length)
         ####################################################################################
         ####################################################################################
-        if hparams['cuda_visible_devices'] == [0]:
-            hparams['architecture']['domain_learning'] = True
-            hparams['warmup']['use'] = True
-            hparams['warmup']['load'] = True
-        if hparams['cuda_visible_devices'] == [2]:
-            hparams['architecture']['domain_learning'] = True
-            hparams['warmup']['use'] = True
-            hparams['warmup']['load'] = True
+        # if hparams['cuda_visible_devices'] == [0]:
+        #     hparams['architecture']['domain_learning'] = True
+        #     hparams['warmup']['use'] = True
+        #     hparams['warmup']['load'] = True
+        # if hparams['cuda_visible_devices'] == [2]:
+        #     hparams['architecture']['domain_learning'] = True
+        #     hparams['warmup']['use'] = True
+        #     hparams['warmup']['load'] = True
         ####################################################################################
         ####################################################################################
         self.cfg = cfg
@@ -86,46 +88,71 @@ class RMT(TTAMethod):
         logger.info('Set self.clip_model.parameters.reguires_grad = False!')
         for param in self.clip_model.parameters():
             param.requires_grad = False
-        self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, self.device)
+
         self.prompt_learner = PromptLearner(hparams, self.clip_model, class_names, num_classes, self.device)
-        if self.hparams['architecture']['learnable_parameters']:
-            self.models['prompt_learner'] = self.prompt_learner
-        if not self.hparams['architecture']['clip_only']:
-            self.optimizers = set_optimizers(hparams, self.models)
         
-        self.prototypes_src = None
-        if self.hparams['prototypes']['use']:
-            prototype_runner = PrototypeRunner(hparams, self.clip_model, src_loader, self.normal_transform, self.clsdst_transform, num_classes, arch_name, ckpt_dir, ckpt_path, dataset_name, self.device)
-            if self.hparams['prototypes']['load']:
-                self.prototypes_src = prototype_runner.load()
-            else:
-                self.prototypes_src = prototype_runner()
-            
-        self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, self.clsdst_transform, dataset_name)
-        self.text_encoder = TextEncoder(hparams, self.clip_model)
+        if not self.hparams['architecture']['clip_only']:
+            self.models = set_models(hparams, self.EMBEDDING_DIM, self.clip_model.dtype, self.device)
+            if self.hparams['architecture']['learnable_parameters']:
+                self.models['prompt_learner'] = self.prompt_learner
+            self.optimizers = set_optimizers(hparams, self.models)
+            self.prototypes_src = None
+            if self.hparams['prototypes']['use']:
+                prototype_runner = PrototypeRunner(hparams, self.clip_model, src_loader, self.normal_transform, self.clsdst_transform, num_classes, arch_name, ckpt_dir, ckpt_path, dataset_name, self.device)
+                if self.hparams['prototypes']['load']:
+                    self.prototypes_src = prototype_runner.load()
+                else:
+                    self.prototypes_src = prototype_runner()
+                
+            self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, self.clsdst_transform, dataset_name)
+            self.text_encoder = TextEncoder(hparams, self.clip_model)
 
-        assert self.hparams['architecture']['sttc_backward'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['sttc_backward']
-        assert self.hparams['architecture']['self_training_use_aug'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['self_training_use_aug']
-        if self.hparams['architecture']['self_training']:
-            self.self_trainer = SelfTrainer(hparams, self.clip_model, lambda_ce_trg)
-        if self.hparams['architecture']['domain_learning']:
-            self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.prototypes_src, self.models['mine'], self.clsdst_transform, self.src_loader.batch_size, num_classes, self.device)
+            assert self.hparams['architecture']['sttc_backward'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['sttc_backward']
+            assert self.hparams['architecture']['self_training_use_aug'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['self_training_use_aug']
+            if self.hparams['architecture']['self_training']:
+                self.self_trainer = SelfTrainer(hparams, self.clip_model, lambda_ce_trg)
+            if self.hparams['architecture']['domain_learning']:
+                self.domain_trainer = DomainTrainer(hparams, self.clip_model, self.prototypes_src, self.models['mine'], self.src_loader.batch_size, save_dir, self.device)
 
-        if self.hparams['warmup']['use']:
-            self.warmup_criterion = nn.CrossEntropyLoss()
-            src_batch_size = self.src_loader.batch_size
-            self.warmup_steps = num_samples_warm_up // src_batch_size
-            self.final_lr = self.optimizers.param_groups[0]['lr']
-            ckpt_path = f"ckpt_warmup_{dataset_name}_{arch_name}_bs{src_batch_size}_step{self.warmup_steps}.pth"
-            self.warmup_ckpt_path = os.path.join(ckpt_dir, "warmup")
-            self.ckpt_path = os.path.join(self.warmup_ckpt_path, ckpt_path)
-            self.warmup()
+            if self.hparams['warmup']['use']:
+                self.warmup_criterion = nn.CrossEntropyLoss()
+                src_batch_size = self.src_loader.batch_size
+                self.warmup_steps = num_samples_warm_up // src_batch_size
+                self.final_lr = self.optimizers.param_groups[0]['lr']
+                ckpt_path = f"ckpt_warmup_{dataset_name}_{arch_name}_bs{src_batch_size}_step{self.warmup_steps}.pth"
+                self.warmup_ckpt_path = os.path.join(ckpt_dir, "warmup")
+                self.ckpt_path = os.path.join(self.warmup_ckpt_path, ckpt_path)
+                self.warmup()
 
 
     def learning(self, x, y=None, warmup=False):
         assert (y is not None and warmup) or (y is None)
-        self.optimizers.zero_grad()
         loss = torch.tensor(0.0, requires_grad=True).cuda()
+        self.optimizers.zero_grad()
+
+        ### Domain Learning
+        if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
+            # iter_num = int(1e+1)
+            # for it in tqdm.tqdm(range(iter_num)):
+            # text
+            domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
+            domain_text_fts = self.text_encoder(domain_prompts, domain_tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
+            norm_domain_text_fts = F.normalize(domain_text_fts)
+            # image
+            image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
+            if self.hparams['architecture']['self_training']:
+                image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+            # Domain Training
+            domain_loss = self.domain_trainer(image_clsdst_fts, norm_domain_text_fts)
+
+            # loss += domain_loss
+            loss -= domain_loss
+            # self.scaler.scale(domain_loss).backward()
+            # self.scaler.step(self.optimizers)
+            # self.scaler.update()
+            # self.optimizers.zero_grad()
+
+        ### Self Training
         # text
         prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
         text_fts = self.text_encoder(prompts, tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
@@ -141,22 +168,6 @@ class RMT(TTAMethod):
             norm_image_fts = F.normalize(image_fts)
             logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
                 
-
-        ### Domain Learning
-        if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
-            # text
-            domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
-            domain_text_fts = self.text_encoder(domain_prompts, domain_tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
-            norm_domain_text_fts = F.normalize(domain_text_fts)
-            # image
-            image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
-            if self.hparams['architecture']['self_training']:
-                image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-            # Domain Training
-            domain_loss = self.domain_trainer(image_clsdst_fts, norm_domain_text_fts)
-            # loss += domain_loss
-            loss -= domain_loss
-        
         ### Cross Entropy Loss with Ground Truth
         if warmup:
             ##### TODO: あれ，これ過学習起きるんじゃない？
@@ -177,6 +188,7 @@ class RMT(TTAMethod):
             if self.hparams['architecture']['self_training']:
                 self.update_ema_variables(self.m_teacher_momentum)
 
+        print(f"loss: {loss.item():.4f}\tdomain_loss: {domain_loss.item():.4f}\tself_train_loss: {self_train_loss.item():.4f}")
         return logits
     
     def update_ema_variables(self, alpha_teacher):
@@ -278,39 +290,42 @@ class SelfTrainer(nn.Module):
 
 
 class DomainTrainer(nn.Module):
-    def __init__(self, hparams, clip_model:CLIP, prototypes_src, mine, clsdst_transform, batch_size, num_classes, device):
+    def __init__(self, hparams, clip_model:CLIP, prototypes_src, mine, batch_size, save_dir, device):
         super().__init__()
         assert hparams['domain_loss']['method'] in ['mine']
         self.hparams = hparams
         self.clip_model = clip_model
         self.prototypes_src = prototypes_src
-        self.clsdst_transform = clsdst_transform
-        self.num_classes = num_classes
+        self.save_dir = save_dir
         self.device = device
+        self.iter_num = 0
         
         self.skp = skp.SinkhornKnopp()
-        self.biclust_model = SpectralBiclustering(n_clusters=hparams['domain_loss']['n_clusters'], method="log", random_state=0)
+        if hparams['domain_loss']['clustering_method'] == 'SpectralBiclustering':
+            self.biclust_model = SpectralBiclustering(n_clusters=hparams['domain_loss']['n_clusters'], method="log", random_state=0)
+        elif hparams['domain_loss']['clustering_method'] == 'SpectralCoclustering':
+            self.biclust_model = SpectralCoclustering(n_clusters=hparams['domain_loss']['n_clusters'][0], random_state=0)
+
         if self.hparams['domain_loss']['method'] == 'mine':
             self.mine_trainer = MineTrainer(mine)
         elif self.hparams['domain_loss']['method'] == 'nt_xent':
             self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
 
     def forward(self, image_clsdst_fts, text_fts):
-        image_clsdst_fts = image_clsdst_fts.mean(dim=0, keepdim=True)
-        image_clsdst_fts = image_clsdst_fts.repeat_interleave(self.num_classes, dim=0)  # 各クラス特徴と結合するために，クラス数文複製する. (num_classes, EMBEDDING_DIM * num_domain_tokens)
         image_clsdst_fts = F.normalize(image_clsdst_fts)
-
+        text_fts = F.normalize(text_fts)
         if self.hparams['prototypes']['use']:
-            indices = torch.randperm(image_clsdst_fts.nelement())[:image_clsdst_fts.shape[0]]
-            sampled_prototypes = self.prototypes_src[indices].squeeze(1).cuda()
-            image_clsdst_fts = torch.cat([image_clsdst_fts, sampled_prototypes], dim=0)
-            if self.hparams['domain_loss']['prompt'] == 'classname':
-                if self.hparams['domain_loss']['to_square'] == 'padding':
-                    # 正方行列にするためにpaddingを追加.
-                    text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
-                    text_fts = torch.cat([text_fts, text_padding], dim=0)
-                elif self.hparams['domain_loss']['to_square'] == 'duplicate':
-                    text_fts = text_fts.repeat_interleave(2, dim=0)
+            indices = torch.randperm(self.prototypes_src.shape[0])[:image_clsdst_fts.shape[0]]
+            sampled_prototypes = self.prototypes_src[indices].cuda()
+            sampled_prototypes = F.normalize(sampled_prototypes)
+            image_clsdst_fts = torch.cat([sampled_prototypes, image_clsdst_fts], dim=0)
+            # if self.hparams['domain_loss']['prompt'] == 'classname':
+            #     if self.hparams['domain_loss']['to_square'] == 'padding':
+            #         # 正方行列にするためにpaddingを追加.
+            #         text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
+            #         text_fts = torch.cat([text_fts, text_padding], dim=0)
+            #     elif self.hparams['domain_loss']['to_square'] == 'duplicate':
+            #         text_fts = torch.cat([text_fts, text_fts], dim=0)
         if self.hparams['domain_loss']['method'] == "nt_xent":
             domain_loss = self.ntxent_criterion(image_clsdst_fts, text_fts)
         elif self.hparams['domain_loss']['method'] == 'mine':
@@ -319,10 +334,28 @@ class DomainTrainer(nn.Module):
                     x2=text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
                     dim=-1).detach().cpu().numpy()  # (B, B)
 
-            bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
-            clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
+            # torch.save(image_clsdst_fts.cpu().detach(), 'prc_image_clsdst_fts.pt')
+            # torch.save(text_fts.cpu().detach(), 'prc_text_fts.pt')
+            # torch.save(sim_mtx, 'prc_sim_mtx.pt')
+            # raise ValueError()
 
-            diag = torch.diag(clustered_mtx).long()
+            ##### Doubly Stochastic Matrix
+            ################################################################
+            ################################################################
+            ################################################################
+            # bistochastic_mtx = self._get_bistochastic_mtx(sim_mtx)  # (B, B)
+            bistochastic_mtx = sim_mtx
+            ################################################################
+            ################################################################
+            ################################################################
+            ##### Biclustering
+            # clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
+            # diag = torch.diag(clustered_mtx).long()
+            self._biclustering(bistochastic_mtx)
+            diag = torch.tensor(self.biclust_model.row_labels_)
+            self._biclustering_log(bistochastic_mtx)
+
+            ##### Minimize Mutual Information
             mean_feat_per_clust = [text_fts[diag == clust].mean(dim=0) for clust in sorted(torch.unique(diag))]
             if len(mean_feat_per_clust) == 1:
                 logger.warning('[Warning] The Number of Clusters is 1')
@@ -333,7 +366,6 @@ class DomainTrainer(nn.Module):
                     data = torch.stack([mean_feat_per_clust[i], mean_feat_per_clust[j]], dim=1)
                     mine_loss, _ = self.mine_trainer.get_loss(data)
                     domain_loss += mine_loss
-
         return domain_loss
 
     def _get_bistochastic_mtx(self, sim_mtx):
@@ -354,6 +386,15 @@ class DomainTrainer(nn.Module):
 
         return clustered_mtx
 
+    def _biclustering_log(self, sim_mtx):
+        if self.iter_num % int(1e+3 * 50) == 0:
+            os.makedirs(os.path.join(self.save_dir, 'biclustering'), exist_ok=True)
+            sorted_sim_mtx = sim_mtx[np.argsort(self.biclust_model.row_labels_)]
+            sorted_sim_mtx = sorted_sim_mtx[:, np.argsort(self.biclust_model.column_labels_)]
+            plt.matshow(sorted_sim_mtx, cmap=plt.cm.Blues)
+            plt.title(f"iter num : {self.iter_num}")
+            plt.savefig(os.path.join(self.save_dir, 'biclustering', f"sim_mtx_{self.iter_num}.png"))
+            self.iter_num += 1
 
 class PromptLearner(nn.Module):
     def __init__(self, hparams, clip_model, class_names, num_classes, device):

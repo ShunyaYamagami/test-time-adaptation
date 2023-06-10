@@ -108,7 +108,7 @@ class PrototypeRunner(nn.Module):
         logger.info("Extracting source prototypes...")
         with torch.no_grad():
             for data in tqdm.tqdm(self.src_loader):
-                if len(features_src) > 10000:
+                if len(features_src) >= 10000:
                     break
                 x = data[0].cuda()
                 x_clsdst = self.clsdst_transform(x)  # (B, 3, 224, 224)
@@ -117,8 +117,8 @@ class PrototypeRunner(nn.Module):
                 features_src = torch.cat([features_src, image_clsdst_fts.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
 
         torch.save(features_src, self.fname)
-        features_src = features_src.to(self.device).unsqueeze(1) 
-        return features_src
+        # features_src = features_src.unsqueeze(1) 
+        return features_src.to(self.device)
 
 
 def decorator_timer(some_function):

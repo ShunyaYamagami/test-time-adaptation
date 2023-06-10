@@ -65,9 +65,10 @@ class MineTrainer():
         marginal = self.sample_batch(data, 'marginal').float()
         mi_lb, t, et = self.mutual_information(joint, marginal)
         self.ma_et = (1 - self.ma_rate) * self.ma_et + self.ma_rate * torch.mean(et)
+        self.ma_et = self.ma_et.detach()
         
         # unbiasing use moving average
-        loss = -(torch.mean(t) - (1 / self.ma_et.mean()).detach() * torch.mean(et))
+        loss = -(torch.mean(t) - (1 / self.ma_et.mean()) * torch.mean(et))
         return loss, mi_lb
 
 
