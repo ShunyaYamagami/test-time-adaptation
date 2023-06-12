@@ -2,7 +2,7 @@ import logging
 from easydict import EasyDict
 import os
 import numpy as np
-import tqdm
+from tqdm import tqdm
 import yaml
 import torch
 import torch.nn as nn
@@ -53,11 +53,16 @@ class RMT(TTAMethod):
         self.hparams = hparams
         assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
         assert isinstance(self.hparams['exec_num'], int)
+        assert self.hparams['architecture']['use_meta_net'] and self.hparams['architecture']['learnable_parameters'] or not self.hparams['architecture']['use_meta_net']
         assert self.hparams['sttc'] in ['linear', 'mlp']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['domain_loss']['prompt'] in [False, 'classname']
         assert self.hparams['warmup']['load'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load'], "if load_model is True, use must be True"
         assert self.hparams['warmup']['use'] and num_samples_warm_up > 0 or not self.hparams['warmup']['use'], "warmup_steps must be set when warmup is used" 
+        if self.hparams['architecture']['clip_only']:
+            for k in self.hparams['architecture'].keys():
+                if k != 'clip_only':
+                    self.hparams['architecture'][k] = False
 
         ########## Set save_dir ##########
         if self.hparams['rename_save_dir']:
@@ -125,13 +130,14 @@ class RMT(TTAMethod):
                 self.warmup()
 
 
+
     def learning(self, x, y=None, warmup=False):
         assert (y is not None and warmup) or (y is None)
         loss = torch.tensor(0.0, requires_grad=True).cuda()
         self.optimizers.zero_grad()
-
+        meta_net = self.models['meta_net'] if self.hparams['architecture']['use_meta_net'] else None
         ### Domain Learning
-        if self.hparams['architecture']['domain_learning'] and not warmup:  # warmupでここも学習すると時間がかかりすぎる.
+        if self.hparams['architecture']['domain_learning']:
             # iter_num = int(1e+1)
             # for it in tqdm.tqdm(range(iter_num)):
             # text
@@ -144,7 +150,6 @@ class RMT(TTAMethod):
                 image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
             # Domain Training
             domain_loss = self.domain_trainer(image_clsdst_fts, norm_domain_text_fts)
-
             # loss += domain_loss
             loss -= domain_loss
             # self.scaler.scale(domain_loss).backward()
@@ -169,8 +174,7 @@ class RMT(TTAMethod):
             logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
                 
         ### Cross Entropy Loss with Ground Truth
-        if warmup:
-            ##### TODO: あれ，これ過学習起きるんじゃない？
+        if warmup:  ##### TODO: あれ，これ過学習起きるんじゃない？
             if self.hparams['architecture']['self_training']:
                 ce_loss = self.warmup_criterion(logits_st, y)
             else:
@@ -180,7 +184,7 @@ class RMT(TTAMethod):
         if loss == 0.0:
             logger.warning('[Warning]: loss is 0.0.')
         if (self.hparams['architecture']['self_training'] and self.hparams['architecture']['sttc_backward']) \
-            or (self.hparams['architecture']['domain_learning'] and not warmup) \
+            or (self.hparams['architecture']['domain_learning']) \
             or warmup:
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizers)
@@ -188,7 +192,7 @@ class RMT(TTAMethod):
             if self.hparams['architecture']['self_training']:
                 self.update_ema_variables(self.m_teacher_momentum)
 
-        print(f"loss: {loss.item():.4f}\tdomain_loss: {domain_loss.item():.4f}\tself_train_loss: {self_train_loss.item():.4f}")
+        # print(f"loss: {loss.item():.4f}\tdomain_loss: {domain_loss.item():.4f}\tself_train_loss: {self_train_loss.item():.4f}")
         return logits
     
     def update_ema_variables(self, alpha_teacher):
@@ -216,7 +220,7 @@ class RMT(TTAMethod):
         else:
             os.makedirs(self.warmup_ckpt_path, exist_ok=True)
             logger.info(f"Starting warm up...{self.warmup_steps} steps")
-            for i in tqdm.tqdm(range(self.warmup_steps)):
+            for i in tqdm(range(self.warmup_steps)):
                 for par in self.optimizers.param_groups:
                     par['lr'] = self.final_lr * (i+1) / self.warmup_steps
                 try:
@@ -279,7 +283,6 @@ class SelfTrainer(nn.Module):
             loss_entropy = symmetric_cross_entropy(x=logits_st, x_ema=logits_ema).mean(0)  # Loss 式(6)
 
         loss_trg = self.lambda_ce_trg * loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
-
         return loss_trg, logits_st, logits_ema
         
     def _get_logits(self, model, image_fts, norm_text_fts):
@@ -311,34 +314,36 @@ class DomainTrainer(nn.Module):
         elif self.hparams['domain_loss']['method'] == 'nt_xent':
             self.ntxent_criterion = NTXentLoss(self.device, batch_size, self.hparams['domain_loss']['nt_xent_temperature'])
 
-    def forward(self, image_clsdst_fts, text_fts):
+    def forward(self, image_clsdst_fts, text_fts, warmup=False):
         image_clsdst_fts = F.normalize(image_clsdst_fts)
         text_fts = F.normalize(text_fts)
-        if self.hparams['prototypes']['use']:
+        if self.hparams['prototypes']['use'] and not warmup:
             indices = torch.randperm(self.prototypes_src.shape[0])[:image_clsdst_fts.shape[0]]
             sampled_prototypes = self.prototypes_src[indices].cuda()
             sampled_prototypes = F.normalize(sampled_prototypes)
             image_clsdst_fts = torch.cat([sampled_prototypes, image_clsdst_fts], dim=0)
-            # if self.hparams['domain_loss']['prompt'] == 'classname':
-            #     if self.hparams['domain_loss']['to_square'] == 'padding':
-            #         # 正方行列にするためにpaddingを追加.
-            #         text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
-            #         text_fts = torch.cat([text_fts, text_padding], dim=0)
-            #     elif self.hparams['domain_loss']['to_square'] == 'duplicate':
-            #         text_fts = torch.cat([text_fts, text_fts], dim=0)
+            """
+            if self.hparams['domain_loss']['prompt'] == 'classname':
+                if self.hparams['domain_loss']['to_square'] == 'padding':
+                    # 正方行列にするためにpaddingを追加.
+                    text_padding = torch.zeros(image_clsdst_fts.shape[0] - text_fts.shape[0], text_fts.shape[1]).cuda()
+                    text_fts = torch.cat([text_fts, text_padding], dim=0)
+                elif self.hparams['domain_loss']['to_square'] == 'duplicate':
+                    text_fts = torch.cat([text_fts, text_fts], dim=0)
+            """
         if self.hparams['domain_loss']['method'] == "nt_xent":
             domain_loss = self.ntxent_criterion(image_clsdst_fts, text_fts)
         elif self.hparams['domain_loss']['method'] == 'mine':
             sim_mtx = F.cosine_similarity(
                     x1=image_clsdst_fts.unsqueeze(0),  # (1, B, EMBEDDING_DIM)
-                    x2=text_fts.unsqueeze(1),  # (B, 1, EMBEDDING_DIM)
-                    dim=-1).detach().cpu().numpy()  # (B, B)
-
-            # torch.save(image_clsdst_fts.cpu().detach(), 'prc_image_clsdst_fts.pt')
-            # torch.save(text_fts.cpu().detach(), 'prc_text_fts.pt')
-            # torch.save(sim_mtx, 'prc_sim_mtx.pt')
-            # raise ValueError()
-
+                    x2=text_fts.unsqueeze(1),  # (n_cls, 1, EMBEDDING_DIM) or (B, 1, EMBEDDING_DIM)
+                    dim=-1).detach().cpu().numpy()  # (B, n_cls) or (B, B)
+            """
+            torch.save(image_clsdst_fts.cpu().detach(), 'prc_image_clsdst_fts.pt')
+            torch.save(text_fts.cpu().detach(), 'prc_text_fts.pt')
+            torch.save(sim_mtx, 'prc_sim_mtx.pt')
+            raise ValueError()
+            """
             ##### Doubly Stochastic Matrix
             ################################################################
             ################################################################
@@ -443,7 +448,7 @@ class PromptLearner(nn.Module):
         ##### Domain Prompt用
         if hparams['architecture']['domain_learning']:
             ##### TODO: ここをどう設計する？Prompt Distribution Learningぽくクラス名を付加させない？その場合類似度行列の列が単一になり，biclusteringもクソもない．
-            if hparams['domain_loss']['prompt'] == 'classname':
+            if not hparams['architecture']['use_meta_net'] and hparams['domain_loss']['prompt'] == 'classname':
                 domain_prompts = [prompt_prefix + ' ' + name + '.' for name in class_names]  # (クラス数)
             else:
                 domain_prompts = prompt_prefix
@@ -452,7 +457,7 @@ class PromptLearner(nn.Module):
                 domain_embedding = clip_model.token_embedding(tokens['domain_tokenized_prompts']).type(clip_model.dtype)  # (1, 77 (各文のトークン数（シーケンス長）), EMBEDDING_DIM)
             tokens['domain_token_prefix'] = domain_embedding[:, :1, :]  # SOS (1, 1, EMBEDDING_DIM)
             tokens['domain_token_suffix'] = domain_embedding[:, 1 + n_ctx:, :]  # CLS, EOS (1, 68, EMBEDDING_DIM)  68 := 77 - num_domain_tokens_tokens - 2.
-            if tokens['domain_token_prefix'].shape[0] == 1:
+            if not hparams['architecture']['use_meta_net'] and tokens['domain_token_prefix'].shape[0] == 1:
                 tokens['domain_token_prefix'] = tokens['domain_token_prefix'].repeat_interleave(self.num_classes, dim=0)
                 tokens['domain_token_suffix'] = tokens['domain_token_suffix'].repeat_interleave(self.num_classes, dim=0)
                 
@@ -516,7 +521,12 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
             rtn_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM)).to(device=device, dtype=clip_model_dtype)
         if hparams['domain_loss']['method'] == 'mine':
             rtn_models['mine'] = Mine().to(device)
-        
+    if hparams['architecture']['use_meta_net'] and hparams['architecture']['learnable_parameters']:
+        rtn_models['meta_net'] = nn.Sequential(
+                                nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM // 16),
+                                nn.ReLU(inplace=True),
+                                nn.Linear(EMBEDDING_DIM // 16, EMBEDDING_DIM),
+                                ).to(device=device, dtype=clip_model_dtype)
     return rtn_models
 
 

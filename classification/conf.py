@@ -419,7 +419,8 @@ def set_hparams():
             'self_training': True,
             'sttc_backward': True,  # warmupだけの場合に使う.
             'self_training_use_aug': False,
-            'learnable_parameters': False,
+            'learnable_parameters': True,
+            'use_meta_net': False,
             'domain_learning': True,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
