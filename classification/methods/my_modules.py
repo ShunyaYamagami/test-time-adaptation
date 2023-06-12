@@ -86,6 +86,7 @@ class PrototypeRunner(nn.Module):
         super().__init__()
         self.clip_model = clip_model
         self.src_loader = src_loader
+        self.normal_transform = normal_transform
         self.clsdst_transform = clsdst_transform
         self.num_classes = num_classes
         self.device = device
@@ -119,6 +120,32 @@ class PrototypeRunner(nn.Module):
         torch.save(features_src, self.fname)
         # features_src = features_src.unsqueeze(1) 
         return features_src.to(self.device)
+
+    def class_forward(self):
+        os.makedirs(self.proto_dir_path, exist_ok=True)
+        features_src = torch.tensor([])
+        labels_src = torch.tensor([])
+        logger.info("Extracting source prototypes...")
+        with torch.no_grad():
+            for data in tqdm.tqdm(self.src_loader):
+                if len(features_src) >= 10000:
+                    break
+                x = data[0].cuda()
+                x = self.normal_transform(x)  # (B, 3, 224, 224)
+                image_clsdst_fts = self.clip_model.encode_image(x)  # (B, EMBEDDING_DIM)
+                image_clsdst_fts = F.normalize(image_clsdst_fts)
+                features_src = torch.cat([features_src, image_clsdst_fts.cpu()], dim=0)  # (画像数, EMBEDDING_DIM)
+                labels_src = torch.cat([labels_src, data[1]], dim=0)
+
+        # create class-wise source prototypes
+        prototypes_src = torch.tensor([])
+        for i in range(self.num_classes):
+            mask = labels_src == i
+            prototypes_src = torch.cat([prototypes_src, features_src[mask].mean(dim=0, keepdim=True)], dim=0)
+
+        prototypes_src = prototypes_src.unsqueeze(1) 
+        torch.save(prototypes_src, self.fname)
+        return prototypes_src.to(self.device)
 
 
 def decorator_timer(some_function):

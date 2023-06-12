@@ -421,20 +421,21 @@ def set_hparams():
             'self_training': True,
             'sttc_backward': True,  # warmupだけの場合に使う.
             'self_training_use_aug': True,
-            'learnable_parameters': True,
-            'use_meta_net': True,
+            'learnable_parameters': False,
+            'use_meta_net': False,
             'domain_learning': False,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "warmup": {
             "use": True,
-            "load": False,
+            "load": True,
             # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            'load_model_fname': None,
+            # 'load_model_fname': None,
         },
         "prototypes": {
             "use": True,
-            "load": True,
+            "load": False,
+            'class_domain': 'class',
         },
         'sttc': 'mlp',  # choice(['linear', 'mlp'])
         "domain_loss": {

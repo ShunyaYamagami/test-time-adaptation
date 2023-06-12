@@ -105,10 +105,14 @@ class RMT(TTAMethod):
             self.prototypes_src = None
             if self.hparams['prototypes']['use']:
                 prototype_runner = PrototypeRunner(hparams, self.clip_model, src_loader, self.normal_transform, self.clsdst_transform, num_classes, arch_name, ckpt_dir, ckpt_path, dataset_name, self.device)
-                if self.hparams['prototypes']['load']:
-                    self.prototypes_src = prototype_runner.load()
+                if hparams['prototypes']['class_domain'] == 'class':
+                    self.prototypes_src = prototype_runner.class_forward()
                 else:
-                    self.prototypes_src = prototype_runner()
+                    if self.hparams['prototypes']['load']:
+                        self.prototypes_src = prototype_runner.load()
+                    else:
+                        self.prototypes_src = prototype_runner()
+                
                 
             self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, self.clsdst_transform, dataset_name)
             self.text_encoder = TextEncoder(hparams, self.clip_model)
@@ -165,7 +169,10 @@ class RMT(TTAMethod):
         norm_text_fts = F.normalize(text_fts)
         if self.hparams['architecture']['self_training']:
             ### Self Training
-            self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
+            # self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
+            norm_fts_st, norm_fts_ema, norm_fts_aug = self.self_trainer.get_features(self.models, image_fts, image_aug_fts)
+            logits_st, logits_ema, logits_aug = self.self_trainer.get_logits(norm_text_fts, norm_fts_st, norm_fts_ema, norm_fts_aug)  # (B, num_classes)
+            self_train_loss = self.self_trainer.get_self_train_loss(logits_st, logits_ema, logits_aug)
             loss += self_train_loss
             logits = logits_st + logits_ema  # Ensembled Logits
         else:
@@ -180,6 +187,17 @@ class RMT(TTAMethod):
             else:
                 ce_loss = self.warmup_criterion(logits, y)
             loss += ce_loss
+        
+        ### Contrastive Loss with Class Prototypes
+        if not warmup and self.hparams['prototypes']['use'] == 'class':
+            if self.hparams['architecture']['self_training']:
+                features_test = norm_fts_st
+                features_aug_test = norm_fts_aug
+            else:
+                features_test = image_fts
+                features_aug_test = image_aug_fts
+            loss_contrastive = self._get_loss_contrastive(features_test, features_aug_test)
+            loss += loss_contrastive
         
         if loss == 0.0:
             logger.warning('[Warning]: loss is 0.0.')
@@ -314,6 +332,82 @@ class RMT(TTAMethod):
             ensembled_logits = self.learning(x[0])
             return ensembled_logits
         
+    def _get_loss_contrastive(self, features_test, features_aug_test):
+        with torch.no_grad():
+            # dist[:, i] contains the distance from every source sample to one test sample
+            dist = F.cosine_similarity(
+                x1=self.prototypes_src.repeat(1, features_test.shape[0], 1),
+                x2=features_test.view(1, features_test.shape[0], features_test.shape[1]).repeat(self.prototypes_src.shape[0], 1, 1),
+                dim=-1)
+
+            # for every test feature, get the nearest source prototype and derive the label
+            _, indices = dist.topk(1, largest=True, dim=0)
+            indices = indices.squeeze(0)
+
+        features = torch.cat([self.prototypes_src[indices],
+                            features_test.view(features_test.shape[0], 1, features_test.shape[1]),
+                            features_aug_test.view(features_test.shape[0], 1, features_test.shape[1])], dim=1)
+        loss_contrastive = self._contrastive_loss(features=features, labels=None)
+        return loss_contrastive
+
+    # Integrated from: https://github.com/HobbitLong/SupContrast/blob/master/losses.py
+    def _contrastive_loss(self, features, labels=None, mask=None):
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).cuda()
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().cuda()
+        else:
+            mask = mask.float().cuda()
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        contrast_feature = self.models['projector'](contrast_feature)
+        contrast_feature = F.normalize(contrast_feature, p=2, dim=1)
+        if self.cfg.CONTRAST.MODE == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.cfg.CONTRAST.MODE == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.cfg.CONTRAST.MODE))
+
+        # compute logits
+        anchor_dot_contrast = torch.div(torch.matmul(anchor_feature, contrast_feature.T), self.cfg.CONTRAST.TEMPERATURE)
+        # for numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+        # mask-out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).cuda(),
+            0
+        )
+        mask = mask * logits_mask
+
+        # compute log_prob
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # compute mean of log-likelihood over positive
+        mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
+
+        # loss
+        base_temperature = self.cfg.CONTRAST.TEMPERATURE
+        loss = - (self.cfg.CONTRAST.TEMPERATURE / base_temperature) * mean_log_prob_pos
+        loss = loss.view(anchor_count, batch_size).mean()
+        return loss
+    
 
 class SelfTrainer(nn.Module):
     def __init__(self, hparams, clip_model:CLIP, lambda_ce_trg):
@@ -378,6 +472,7 @@ class DomainTrainer(nn.Module):
         image_clsdst_fts = F.normalize(image_clsdst_fts)
         text_fts = F.normalize(text_fts)
         if self.hparams['prototypes']['use'] and not warmup:
+            assert self.hparams['prototypes']['class_domain'] == 'domain'
             indices = torch.randperm(self.prototypes_src.shape[0])[:image_clsdst_fts.shape[0]]
             sampled_prototypes = self.prototypes_src[indices].cuda()
             sampled_prototypes = F.normalize(sampled_prototypes)
@@ -659,6 +754,11 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
                                 nn.ReLU(inplace=True),
                                 nn.Linear(EMBEDDING_DIM // 16, EMBEDDING_DIM),
                                 ).to(device=device, dtype=clip_model_dtype)
+        
+    if hparams['prototypes']['class_domain'] == 'class':
+        rtn_models['projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, 128),
+                                            nn.ReLU(),
+                                            nn.Linear(128, 128)).cuda()
     return rtn_models
 
 
