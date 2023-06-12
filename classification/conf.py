@@ -171,7 +171,8 @@ _C.RMT.LAMBDA_CONT = 1.0
 ########################################################################################################
 ########################################################################################################
 _C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
-# _C.RMT.NUM_SAMPLES_WARM_UP = 400000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+_C.RMT.NUM_SAMPLES_WARM_UP = 50000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+# _C.RMT.NUM_SAMPLES_WARM_UP = 100000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 ########################################################################################################
 ########################################################################################################
@@ -244,7 +245,8 @@ _C.TEST = CfgNode()
 _C.TEST.NUM_WORKERS = 4
 
 # Batch size for evaluation (and updates for norm + tent)
-_C.TEST.BATCH_SIZE = 128
+# _C.TEST.BATCH_SIZE = 128
+_C.TEST.BATCH_SIZE = 120
 
 # If the batch size is 1, a sliding window approach can be applied by setting window length > 1
 _C.TEST.WINDOW_LENGTH = 1
@@ -420,13 +422,13 @@ def set_hparams():
             'sttc_backward': True,  # warmupだけの場合に使う.
             'self_training_use_aug': False,
             'learnable_parameters': True,
-            'use_meta_net': False,
-            'domain_learning': True,
+            'use_meta_net': True,
+            'domain_learning': False,
             # 'domain_token_dim': 8,  # sepdim用．num_domain_tokensは全体のトークン次元, domain_token_dimは'sepdim'用.
         }, # 下でupdate
         "warmup": {
             "use": True,
-            "load": True,
+            "load": False,
             'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
             # 'load_model_fname': None,
         },

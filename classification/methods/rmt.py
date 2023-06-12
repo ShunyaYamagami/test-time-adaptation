@@ -112,6 +112,9 @@ class RMT(TTAMethod):
             self.image_encoder = ImageEncoder(hparams, self.clip_model, self.normal_transform, self.clsdst_transform, dataset_name)
             self.text_encoder = TextEncoder(hparams, self.clip_model)
 
+            if self.hparams['architecture']['use_meta_net']:
+                self.meta_net_trainer = MetaNetTrainer(hparams, self.clip_model, self.models['meta_net'], self.device)
+
             assert self.hparams['architecture']['sttc_backward'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['sttc_backward']
             assert self.hparams['architecture']['self_training_use_aug'] and self.hparams['architecture']['self_training'] or not self.hparams['architecture']['self_training_use_aug']
             if self.hparams['architecture']['self_training']:
@@ -135,17 +138,14 @@ class RMT(TTAMethod):
         assert (y is not None and warmup) or (y is None)
         loss = torch.tensor(0.0, requires_grad=True).cuda()
         self.optimizers.zero_grad()
-        meta_net = self.models['meta_net'] if self.hparams['architecture']['use_meta_net'] else None
         ### Domain Learning
         if self.hparams['architecture']['domain_learning']:
             # iter_num = int(1e+1)
             # for it in tqdm.tqdm(range(iter_num)):
-            # text
+            image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
             domain_prompts, domain_tokenized_prompts = self.prompt_learner(class_domain='domain')
             domain_text_fts = self.text_encoder(domain_prompts, domain_tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
             norm_domain_text_fts = F.normalize(domain_text_fts)
-            # image
-            image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
             if self.hparams['architecture']['self_training']:
                 image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
             # Domain Training
@@ -158,12 +158,10 @@ class RMT(TTAMethod):
             # self.optimizers.zero_grad()
 
         ### Self Training
-        # text
+        image_fts, image_aug_fts = self.image_encoder(x, class_domain='class')
         prompts, tokenized_prompts = self.prompt_learner(class_domain='class')
         text_fts = self.text_encoder(prompts, tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
         norm_text_fts = F.normalize(text_fts)
-        # image
-        image_fts, image_aug_fts = self.image_encoder(x, class_domain='class')
         if self.hparams['architecture']['self_training']:
             ### Self Training
             self_train_loss, logits_st, logits_ema = self.self_trainer(self.models, image_fts, image_aug_fts, norm_text_fts)
@@ -172,7 +170,8 @@ class RMT(TTAMethod):
         else:
             norm_image_fts = F.normalize(image_fts)
             logits = self.clip_model.logit_scale.exp() * norm_image_fts @ norm_text_fts.t()  # (B, num_classes)
-                
+            # 加算するlossがない.
+
         ### Cross Entropy Loss with Ground Truth
         if warmup:  ##### TODO: あれ，これ過学習起きるんじゃない？
             if self.hparams['architecture']['self_training']:
@@ -204,6 +203,47 @@ class RMT(TTAMethod):
         for ema_param, param in zip(self.models['model_ema'].parameters(), self.models['model_st'].parameters()):
             ema_param.data[:] = alpha_teacher * ema_param[:].data[:] + (1 - alpha_teacher) * param[:].data[:]
     
+    def learning_meta_net(self, x_batch, y_batch=None, warmup=False):
+        assert (y_batch is not None and warmup) or (y_batch is None)
+        batch_logits = torch.Tensor([]).cuda()
+        step = 40
+        assert len(x_batch) % step == 0
+        for i in range(0, len(x_batch), step):
+            x = x_batch[i:i+step]
+            
+            self.optimizers.zero_grad()
+            loss = 0.
+            ### Domain
+            if self.hparams['architecture']['domain_learning']:
+                image_clsdst_fts, _ = self.image_encoder(x, class_domain='domain')
+                logits, _, _ = self.meta_net_trainer(self.prompt_learner, self.text_encoder, image_clsdst_fts, class_domain='domain',
+                                                                            models=self.models, self_trainer=self.self_trainer)
+            ### Class
+            image_fts, image_aug_fts = self.image_encoder(x, class_domain='class')
+            if self.hparams['architecture']['self_training']:
+                logits, logits_st, self_train_loss = self.meta_net_trainer(self.prompt_learner, self.text_encoder, image_fts, image_aug_fts, class_domain='class',
+                                                                            models=self.models, self_trainer=self.self_trainer)
+                loss += self_train_loss
+            else:
+                logits, _, _ = self.meta_net_trainer(self.prompt_learner, self.text_encoder, image_fts, image_aug_fts, class_domain='class')
+
+            ### Cross Entropy Loss with Ground Truth
+            if warmup:  # TODO: あれ，これ過学習起きるんじゃない？
+                y = y_batch[i:i+step]
+                if self.hparams['architecture']['self_training']:
+                    ce_loss = self.warmup_criterion(logits_st, y)
+                else:
+                    ce_loss = self.warmup_criterion(logits, y)
+                loss += ce_loss
+
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizers)
+            self.scaler.update()
+            self.optimizers.zero_grad()
+            batch_logits = torch.cat([batch_logits, logits], dim=0)
+        return batch_logits
+
+
     def warmup(self):
         if self.hparams['warmup']['load'] and os.path.exists(self.ckpt_path):
             logger.info(f"Loading warmup checkpoint... from {self.ckpt_path}")
@@ -230,7 +270,10 @@ class RMT(TTAMethod):
                     src_batch = next(self.src_loader_iter)
                 x = src_batch[0].to(self.device)
                 y = src_batch[1].to(self.device)
-                logits = self.learning(x, y, warmup=True)
+                if self.hparams['architecture']['use_meta_net']:
+                    logits = self.learning_meta_net(x, y, warmup=True)
+                else:
+                    logits = self.learning(x, y, warmup=True)
                 if i % 50 == 0 or i == self.warmup_steps-1:
                     acc = logits.argmax(dim=1).eq(y).sum().item() / y.size(0)
                     logger.info(f"step: {i}\tacc: {acc*100:.2f}%")
@@ -260,6 +303,9 @@ class RMT(TTAMethod):
         if self.hparams['architecture']['clip_only']:
             logits = self.clip_only_learning(x[0])
             return logits
+        elif self.hparams['architecture']['use_meta_net']:
+            ensembled_logits = self.learning_meta_net(x[0])
+            return ensembled_logits
         else:
             ensembled_logits = self.learning(x[0])
             return ensembled_logits
@@ -273,23 +319,33 @@ class SelfTrainer(nn.Module):
         self.lambda_ce_trg = lambda_ce_trg
 
     def forward(self, models, image_fts, image_aug_fts, norm_text_fts):
-        logits_st = self._get_logits(models['model_st'], image_fts, norm_text_fts)  # (B, num_classes)
-        logits_ema = self._get_logits(models['model_ema'], image_fts, norm_text_fts)  # (B, num_classes)
-        
+        norm_fts_st, norm_fts_ema, norm_fts_aug = self.get_features(models, image_fts, image_aug_fts)
+        logits_st, logits_ema, logits_aug = self.get_logits(norm_text_fts, norm_fts_st, norm_fts_ema, norm_fts_aug)  # (B, num_classes)
+        loss_entropy = self.get_self_train_loss(logits_st, logits_ema, logits_aug)
+        # loss_trg = self.lambda_ce_trg * loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
+        loss_trg = loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
+        return loss_trg, logits_st, logits_ema
+
+    def get_features(self, models, image_fts, image_aug_fts):
+        norm_fts_st  = F.normalize(models['model_st'](image_fts))
+        norm_fts_ema = F.normalize(models['model_ema'](image_fts))
+        norm_fts_aug = F.normalize(models['model_ema'](image_aug_fts)) if self.hparams['architecture']['self_training_use_aug'] else None
+        return norm_fts_st, norm_fts_ema, norm_fts_aug
+
+    def get_logits(self, norm_text_fts, norm_fts_st, norm_fts_ema, norm_fts_aug=None):
+        assert (self.hparams['architecture']['self_training_use_aug'] and norm_fts_aug is not None) or not self.hparams['architecture']['self_training_use_aug']
+        logits_st = self.clip_model.logit_scale.exp() * norm_fts_st @ norm_text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
+        logits_ema = self.clip_model.logit_scale.exp() * norm_fts_ema @ norm_text_fts.t()
+        logits_aug = self.clip_model.logit_scale.exp() * norm_fts_aug @ norm_text_fts.t() if self.hparams['architecture']['self_training_use_aug'] else None
+        return logits_st, logits_ema, logits_aug
+
+    def get_self_train_loss(self, logits_st, logits_ema, logits_aug=None):
+        assert (self.hparams['architecture']['self_training_use_aug'] and logits_aug is not None) or not self.hparams['architecture']['self_training_use_aug']
         if self.hparams['architecture']['self_training_use_aug']:
-            logits_aug = self._get_logits(models['model_st'], image_aug_fts, norm_text_fts)  # (B, num_classes)
             loss_entropy = self_training_loss(x=logits_st, x_aug=logits_aug, x_ema=logits_ema).mean(0)  # Loss 式(6)
         else:
             loss_entropy = symmetric_cross_entropy(x=logits_st, x_ema=logits_ema).mean(0)  # Loss 式(6)
-
-        loss_trg = self.lambda_ce_trg * loss_entropy  # Loss 式(9)のうち, targetドメインに対するLoss (第1項)
-        return loss_trg, logits_st, logits_ema
-        
-    def _get_logits(self, model, image_fts, norm_text_fts):
-        sttc_fts = model(image_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
-        norm_sttc_fts = F.normalize(sttc_fts)
-        logits = self.clip_model.logit_scale.exp() * norm_sttc_fts @ norm_text_fts.t()  # (B, num_classes)  # self.clip_model.logit_scale.exp()によるスケール変換は, 類似度スコアの非負化を行い、類似度の解釈や比較を容易にし，指数関数によるスケール変換は正規化や確率的な処理にも関連する．
-        return logits
+        return loss_entropy
 
 
 class DomainTrainer(nn.Module):
@@ -463,7 +519,8 @@ class PromptLearner(nn.Module):
                 
         self.tokens = tokens
 
-    def forward(self, class_domain='class'):
+    def forward(self, class_domain, image_fts=None, meta_net=None):
+        assert (self.hparams['architecture']['use_meta_net'] and image_fts is not None and meta_net is not None) or not self.hparams['architecture']['use_meta_net']
         if class_domain == 'class':
             prefix = self.tokens['token_prefix']
             suffix = self.tokens['token_suffix']
@@ -473,15 +530,83 @@ class PromptLearner(nn.Module):
             suffix = self.tokens['domain_token_suffix']
             tokenized_prompts = self.tokens['domain_tokenized_prompts']
             
-        if self.hparams['architecture']['learnable_parameters']:
-            ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+        if self.hparams['architecture']['use_meta_net']:
+            # refer to CoCoOp.
+            ctx = self.ctx.unsqueeze(0)  # (1, n_ctx, EMBEDDING_DIM)
+            bias = meta_net(image_fts)  # (B, EMBEDDING_DIM)
+            bias = bias.unsqueeze(1)  # (B, 1, EMBEDDING_DIM)
+            ctx_shifted = ctx + bias  # (B, n_ctx, EMBEDDING_DIM)
+            # Use instance-conditioned context tokens for all classes
+            prompts = []
+            if class_domain == 'class':
+                for ctx_shifted_i in ctx_shifted:
+                    ctx_i = ctx_shifted_i.unsqueeze(0).expand(self.num_classes, -1, -1)
+                    pts_i = torch.cat([prefix, ctx_i, suffix], dim=1)  # (n_cls, n_tkn, ctx_dim)
+                    prompts.append(pts_i)
+                prompts = torch.stack(prompts)
+                return prompts, tokenized_prompts  # (B, n_cls, n_ctx, EMBEDDING_DIM)
+            else:
+                prefix = prefix.repeat_interleave(image_fts.shape[0], dim=0)
+                suffix = suffix.repeat_interleave(image_fts.shape[0], dim=0)
+                prompts = torch.cat([prefix, ctx_shifted, suffix], dim=1)  # (B, n_tkn, ctx_dim)
+                return prompts, tokenized_prompts  # (B, n_ctx, EMBEDDING_DIM)
         else:
-            ctx = self.tokens['template_embedding']
+            if self.hparams['architecture']['learnable_parameters']:
+                ctx = self.ctx.unsqueeze(0).repeat_interleave(self.num_classes, dim=0)
+            else:
+                ctx = self.tokens['template_embedding']
+            prompts = torch.cat([prefix, ctx, suffix], dim=1)
+            
+            return prompts, tokenized_prompts
 
-        prompts = torch.cat([prefix, ctx, suffix], dim=1)
-        
-        return prompts, tokenized_prompts
-    
+
+class MetaNetTrainer(nn.Module):
+    def __init__(self, hparams, clip_model:CLIP, meta_net, device):
+        super().__init__()
+        self.hparams = hparams
+        self.clip_model = clip_model
+        self.meta_net = meta_net
+        self.device = device
+
+    def forward(self, prompt_learner:PromptLearner, text_encoder:TextEncoder, image_fts, image_aug_fts, class_domain,
+                    models=None, self_trainer:SelfTrainer=None):
+        """
+            image_fts : outpu of Image Encoder of CLIP
+        """
+        assert (self.hparams['architecture']['self_training'] and models is not None and self_trainer is not None) or not self.hparams['architecture']['self_training']
+        if self.hparams['architecture']['self_training']:
+            norm_fts_st, norm_fts_ema, norm_fts_aug = self_trainer.get_features(models, image_fts, image_aug_fts)
+            image_fts = norm_fts_st
+        prompts, tokenized_prompts = prompt_learner(class_domain=class_domain, image_fts=image_fts, meta_net=self.meta_net)
+        if class_domain == 'class':
+            logits_ensembled_list = []
+            logits_st_list = []
+            loss = 0.
+            norm_image_fts = F.normalize(image_fts)
+            for i in range(prompts.shape[0]):
+                text_features = text_encoder(prompts[i], tokenized_prompts)
+                text_features = F.normalize(text_features)
+                if self.hparams['architecture']['self_training']:
+                    n_ft_aug = norm_fts_aug[i] if self.hparams['architecture']['self_training_use_aug'] else None
+                    logits_st, logits_ema, logits_aug = self_trainer.get_logits(text_features, norm_fts_st[i], norm_fts_ema[i], n_ft_aug)
+                    logits_ensembled_list.append(logits_st + logits_ema)
+                    logits_st_list.append(logits_st)
+                    l_aug = logits_aug.unsqueeze(0) if self.hparams['architecture']['self_training_use_aug'] else None
+                    self_train_loss = self_trainer.get_self_train_loss(logits_st.unsqueeze(0), logits_ema.unsqueeze(0), l_aug)
+                    loss += self_train_loss
+                else:
+                    l_i = self.clip_model.logit_scale.exp() * norm_image_fts[i] @ text_features.t()
+                    logits_ensembled_list.append(l_i)
+                    logits_st_list.append(l_i)
+            logits_ensembled = torch.stack(logits_ensembled_list, dim=0)
+            logits_st = torch.stack(logits_st_list, dim=0)
+            return logits_ensembled, logits_st, loss
+        else:
+            text_features = text_encoder(prompts, tokenized_prompts)
+            text_features = F.normalize(text_features)
+            logits = self.clip_model.logit_scale.exp() * image_fts @ text_features.t()
+            return logits, None, 0.
+
 
 @torch.jit.script
 def self_training_loss(x, x_aug, x_ema):# -> torch.Tensor:
@@ -521,7 +646,8 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
             rtn_models['domain_projector'] = nn.Sequential(nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM)).to(device=device, dtype=clip_model_dtype)
         if hparams['domain_loss']['method'] == 'mine':
             rtn_models['mine'] = Mine().to(device)
-    if hparams['architecture']['use_meta_net'] and hparams['architecture']['learnable_parameters']:
+    ##### Meta Net
+    if hparams['architecture']['use_meta_net']:
         rtn_models['meta_net'] = nn.Sequential(
                                 nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM // 16),
                                 nn.ReLU(inplace=True),
