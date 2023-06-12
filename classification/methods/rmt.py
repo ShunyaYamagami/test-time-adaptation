@@ -20,6 +20,7 @@ from sklearn.cluster import SpectralBiclustering, SpectralCoclustering
 from pathlib import Path
 from functools import partial
 from matplotlib import pyplot as plt
+from multiprocessing import Pool
 
 from conf import get_num_classes
 from domainbed import networks
@@ -223,6 +224,7 @@ class RMT(TTAMethod):
             if self.hparams['architecture']['self_training']:
                 logits, logits_st, self_train_loss = self.meta_net_trainer(self.prompt_learner, self.text_encoder, image_fts, image_aug_fts, class_domain='class',
                                                                             models=self.models, self_trainer=self.self_trainer)
+                # self_train_loss *= 0.5
                 loss += self_train_loss
             else:
                 logits, _, _ = self.meta_net_trainer(self.prompt_learner, self.text_encoder, image_fts, image_aug_fts, class_domain='class')
@@ -235,7 +237,6 @@ class RMT(TTAMethod):
                 else:
                     ce_loss = self.warmup_criterion(logits, y)
                 loss += ce_loss
-
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizers)
             self.scaler.update()
@@ -415,7 +416,8 @@ class DomainTrainer(nn.Module):
             ##### Biclustering
             # clustered_mtx = self._biclustering(bistochastic_mtx)  # (B, B)
             # diag = torch.diag(clustered_mtx).long()
-            self._biclustering(bistochastic_mtx)
+            with Pool(processes=self.hparams['n_processes']) as pool:
+                pool.map(self._biclustering(bistochastic_mtx))
             diag = torch.tensor(self.biclust_model.row_labels_)
             self._biclustering_log(bistochastic_mtx)
 
@@ -603,7 +605,8 @@ class MetaNetTrainer(nn.Module):
                     logits_st_list.append(l_i)
             logits_ensembled = torch.stack(logits_ensembled_list, dim=0)
             logits_st = torch.stack(logits_st_list, dim=0)
-            return logits_ensembled, logits_st, loss
+            loss_mean = loss / prompts.shape[0]
+            return logits_ensembled, logits_st, loss_mean
         else:
             text_features = text_encoder(prompts, tokenized_prompts)
             text_features = F.normalize(text_features)

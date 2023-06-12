@@ -420,7 +420,7 @@ def set_hparams():
             'clip_only': False,
             'self_training': True,
             'sttc_backward': True,  # warmupだけの場合に使う.
-            'self_training_use_aug': False,
+            'self_training_use_aug': True,
             'learnable_parameters': True,
             'use_meta_net': True,
             'domain_learning': False,
@@ -429,8 +429,8 @@ def set_hparams():
         "warmup": {
             "use": True,
             "load": False,
-            'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            # 'load_model_fname': None,
+            # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
+            'load_model_fname': None,
         },
         "prototypes": {
             "use": True,
@@ -449,6 +449,7 @@ def set_hparams():
         "cuda_visible_devices": list(map(int, os.environ.get('CUDA_VISIBLE_DEVICES').split(","))),
         "exec_num": int(os.environ.get('exec_num')),
         "rename_save_dir": False,
+        'n_processes': 8,
     })
 
     return hparams
