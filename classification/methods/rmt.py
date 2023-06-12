@@ -208,7 +208,7 @@ class RMT(TTAMethod):
         batch_logits = torch.Tensor([]).cuda()
         step = 40
         assert len(x_batch) % step == 0
-        for i in range(0, len(x_batch), step):
+        for i in range(0, len(x_batch), step):  # 小さいchunkに分けないと, 勾配情報が蓄積され, メモリが足りなくなる.
             x = x_batch[i:i+step]
             
             self.optimizers.zero_grad()
@@ -240,6 +240,9 @@ class RMT(TTAMethod):
             self.scaler.step(self.optimizers)
             self.scaler.update()
             self.optimizers.zero_grad()
+            if self.hparams['architecture']['self_training']:
+                self.update_ema_variables(self.m_teacher_momentum)
+
             batch_logits = torch.cat([batch_logits, logits], dim=0)
         return batch_logits
 
@@ -571,7 +574,7 @@ class MetaNetTrainer(nn.Module):
     def forward(self, prompt_learner:PromptLearner, text_encoder:TextEncoder, image_fts, image_aug_fts, class_domain,
                     models=None, self_trainer:SelfTrainer=None):
         """
-            image_fts : outpu of Image Encoder of CLIP
+            image_fts : output of Image Encoder of CLIP
         """
         assert (self.hparams['architecture']['self_training'] and models is not None and self_trainer is not None) or not self.hparams['architecture']['self_training']
         if self.hparams['architecture']['self_training']:
