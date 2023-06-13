@@ -55,7 +55,7 @@ class RMT(TTAMethod):
         assert isinstance(self.hparams['cuda_visible_devices'], list) and all(isinstance(x, int) for x in self.hparams['cuda_visible_devices']), "cuda_visible_devices must be list of int."
         assert isinstance(self.hparams['exec_num'], int)
         assert self.hparams['architecture']['use_meta_net'] and self.hparams['architecture']['learnable_parameters'] or not self.hparams['architecture']['use_meta_net']
-        assert self.hparams['sttc'] in ['linear', 'mlp']
+        assert self.hparams['sttc'] in ['linear', 'mlp', 'transformer']
         assert self.hparams['domain_loss']['method'] in ['nt_xent', 'mine']
         assert self.hparams['domain_loss']['prompt'] in [False, 'classname']
         assert self.hparams['warmup']['load'] and self.hparams['warmup']['use'] or not self.hparams['warmup']['load'], "if load_model is True, use must be True"
@@ -152,7 +152,7 @@ class RMT(TTAMethod):
             domain_text_fts = self.text_encoder(domain_prompts, domain_tokenized_prompts)  # (num_classes, EMBEDDING_DIM)
             norm_domain_text_fts = F.normalize(domain_text_fts)
             if self.hparams['architecture']['self_training']:
-                image_clsdst_fts = self.models['model_st'](image_clsdst_fts)  # (B, EMBEDDING_DIM * num_domain_tokens)
+                image_clsdst_fts = apply_sttc_model(self.models['model_st'], image_clsdst_fts)
             # Domain Training
             domain_loss = self.domain_trainer(image_clsdst_fts, norm_domain_text_fts)
             # loss += domain_loss
@@ -425,9 +425,9 @@ class SelfTrainer(nn.Module):
         return loss_trg, logits_st, logits_ema
 
     def get_features(self, models, image_fts, image_aug_fts):
-        norm_fts_st  = F.normalize(models['model_st'](image_fts))
-        norm_fts_ema = F.normalize(models['model_ema'](image_fts))
-        norm_fts_aug = F.normalize(models['model_ema'](image_aug_fts)) if self.hparams['architecture']['self_training_use_aug'] else None
+        norm_fts_st  = F.normalize(apply_sttc_model(models['model_st'], image_fts))
+        norm_fts_ema = F.normalize(apply_sttc_model(models['model_ema'], image_fts))
+        norm_fts_aug = F.normalize(apply_sttc_model(models['model_ema'], image_aug_fts)) if self.hparams['architecture']['self_training_use_aug'] else None
         return norm_fts_st, norm_fts_ema, norm_fts_aug
 
     def get_logits(self, norm_text_fts, norm_fts_st, norm_fts_ema, norm_fts_aug=None):
@@ -732,6 +732,8 @@ def set_models(hparams, EMBEDDING_DIM, clip_model_dtype, device):
             rtn_models['model_st'] = nn.Linear(EMBEDDING_DIM, EMBEDDING_DIM ).to(device=device, dtype=clip_model_dtype)
         elif hparams['sttc'] == 'mlp':
             rtn_models['model_st'] = networks.MLP(EMBEDDING_DIM, EMBEDDING_DIM, hparams).to(device=device, dtype=clip_model_dtype)
+        elif hparams['sttc'] == 'transformer':
+            rtn_models['model_st'] = nn.Transformer(d_model=EMBEDDING_DIM, nhead=8, num_encoder_layers=6, num_decoder_layers=0).to(device=device, dtype=clip_model_dtype)
         rtn_models['model_st'].apply(init_weights)
         rtn_models['model_ema'] = TTAMethod.copy_model(rtn_models['model_st'])
         for param in rtn_models['model_ema'].parameters():
@@ -774,3 +776,14 @@ def set_optimizers(hparams, models):
         optimizers = torch.optim.SGD(class_args_params, lr=hparams['lr'], momentum=hparams['momentum'])
 
     return optimizers
+
+def apply_sttc_model(sttc_model, x):
+    if isinstance(sttc_model, nn.Transformer):
+        x = x.unsqueeze(1)
+        x = x.permute(1, 0, 2)
+        x = sttc_model.encoder(x)
+        x = x.permute(1, 0, 2)
+        x = x.squeeze(1)
+        return x
+    else:
+        return sttc_model(x)

@@ -171,8 +171,7 @@ _C.RMT.LAMBDA_CONT = 1.0
 ########################################################################################################
 ########################################################################################################
 _C.RMT.NUM_SAMPLES_WARM_UP = 500000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
-_C.RMT.NUM_SAMPLES_WARM_UP = 50000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
-# _C.RMT.NUM_SAMPLES_WARM_UP = 100000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
+# _C.RMT.NUM_SAMPLES_WARM_UP = 200000  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 # _C.RMT.NUM_SAMPLES_WARM_UP = 500  # cifar10なら200000で十二分と思ったが，500000じゃないとTTA時に精度めちゃ悪い,
 ########################################################################################################
 ########################################################################################################
@@ -428,16 +427,16 @@ def set_hparams():
         }, # 下でupdate
         "warmup": {
             "use": True,
-            "load": True,
+            "load": False,
             # 'load_model_fname': 'ckpt_warmup_cifar10_c_Standard_bs200_step2500__26__not_learnable_params__not_domain_learning.pth',
-            # 'load_model_fname': None,
+            'load_model_fname': None,
         },
         "prototypes": {
-            "use": True,
+            "use": False,
             "load": False,
             'class_domain': 'class',
         },
-        'sttc': 'mlp',  # choice(['linear', 'mlp'])
+        'sttc': 'transformer',  # choice(['linear', 'mlp', 'transformer'])
         "domain_loss": {
             "use_domain_projector": False,
             'n_clusters': (4, 4),
