@@ -436,7 +436,7 @@ def set_hparams():
             "load": False,
             'class_domain': 'class',
         },
-        'sttc': 'transformer',  # choice(['linear', 'mlp', 'transformer'])
+        'sttc': 'mlp',  # choice(['linear', 'mlp', 'transformer'])
         "domain_loss": {
             "use_domain_projector": False,
             'n_clusters': (4, 4),
